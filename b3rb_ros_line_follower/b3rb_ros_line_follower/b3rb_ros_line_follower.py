@@ -269,30 +269,10 @@ class NavigationAction(Behavior):
             elif desired_dir in ["straight", "Straight", "up", "Up"]:
                 raw_turn = 0.0
             else:
-                # --- Trend-based prediction instead of fixed hard-steer ---
-                if node.blind_frame_count == 1 and len(node.error_history) >= 3:
-                    # Only compute prediction ONCE when we first go blind,
-                    # then hold it steady for the duration of the blind period.
-                    recent = node.error_history[-5:]
-                    # Simple linear trend: average delta between consecutive errors
-                    deltas = [recent[i+1] - recent[i] for i in range(len(recent)-1)]
-                    avg_delta = sum(deltas) / len(deltas) if deltas else 0.0
-                    trend_error = recent[-1] + avg_delta * 3  # extrapolate a few steps ahead
-                    trend_error = max(-1.0, min(1.0, trend_error))
-
-                    # Scale predicted turn by trend severity, not a fixed constant
-                    node.blind_turn_estimate = max(-0.7, min(0.7, trend_error * 1.5))
-                    node.get_logger().info(f"Blind turn predicted: {node.blind_turn_estimate:.2f}", throttle_duration_sec=0.5)
-                elif node.blind_frame_count == 1:
-                    # Not enough history yet, fall back to last_error sign
-                    if node.last_error > 0.2:
-                        node.blind_turn_estimate = 0.6
-                    elif node.last_error < -0.2:
-                        node.blind_turn_estimate = -0.6
-                    else:
-                        node.blind_turn_estimate = -0.5
-
-                raw_turn = node.blind_turn_estimate
+                # Safety-net fallback: we don't have a resolved direction, so hold the current smoothed turn steady
+                # rather than guessing a new direction, as this is now a rare edge case.
+                raw_turn = node.smoothed_turn
+                node.get_logger().warn("Intersection: No resolved direction available, holding current smoothed turn.", throttle_duration_sec=1.0)
         elif vectors.vector_count == 1:
             node.blind_frame_count = 0  # reset when lines reappear
             deviation = vectors.vector_1[1].x - vectors.vector_1[0].x
