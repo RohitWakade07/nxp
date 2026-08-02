@@ -154,7 +154,7 @@ class ObjectRecognizer(Node):
         # Combine original image and side panelata 
         combined_img = np.hstack((image, side_panel))
 
-        cv2.imshow("Sign Board Detection", combined_img)
+        # cv2.imshow("Sign Board Detection", combined_img)
         cv2.waitKey(1)
 
     def classify_sign(self, image):

@@ -71,7 +71,7 @@ class QRDetector(Node):
                 pt1 = (int(pts[0][0][0]), int(pts[0][0][1]))
                 cv2.putText(image, payload['data'], (pt1[0], pt1[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
-        cv2.imshow("QR Code Detection", image)
+        # cv2.imshow("QR Code Detection", image)
         cv2.waitKey(1)
 
     def detect_qr_code(self, image):

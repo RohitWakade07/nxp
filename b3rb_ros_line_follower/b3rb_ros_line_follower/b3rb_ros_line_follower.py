@@ -24,6 +24,7 @@ import cv2
 from sensor_msgs.msg import Joy, LaserScan
 from std_msgs.msg import String
 from synapse_msgs.msg import EdgeVectors, ServerCommunication
+from nav_msgs.msg import Odometry
 import subprocess
 
 from enum import Enum
@@ -103,6 +104,7 @@ class HandleCommunication(Behavior):
                 node.current_target = node.received_target
                 node.received_target = None
                 node.comm_state = "IDLE"
+                node.resume_from_stop_time = node.get_clock().now().nanoseconds / 1e9
                 node.get_logger().info(f"Received target {node.current_target}, resuming navigation")
                 return NodeStatus.SUCCESS
             return NodeStatus.RUNNING
@@ -125,6 +127,66 @@ class HandleCommunication(Behavior):
         elif node.comm_state == "DONE":
             node.rover_move_manual_mode(0.0, 0.0)
             return NodeStatus.SUCCESS
+
+        return NodeStatus.FAILURE
+
+class MissionStateHandler(Behavior):
+    def tick(self, node):
+        if getattr(node, 'mission_state', 'INIT') == "INIT":
+            if getattr(node, 'received_target', None) is not None and node.comm_state == "IDLE":
+                node.current_target = node.received_target
+                node.received_target = None
+                node.get_logger().info(f"INIT: Received target {node.current_target} from control panel, starting!")
+                
+            if getattr(node, 'current_target', None) is None:
+                node.rover_move_manual_mode(0.0, 0.0)
+                return NodeStatus.RUNNING
+            else:
+                node.mission_state = "DRIVE_TO_SOURCE"
+                return NodeStatus.FAILURE
+
+        elif node.mission_state == "DRIVE_TO_SOURCE":
+            if getattr(node, 'last_qr_data', None) is not None and node.comm_state == "IDLE":
+                node.mission_state = "DRIVE_30M_POST_QR"
+                node.distance_since_qr = 0.0
+            return NodeStatus.FAILURE
+
+        elif node.mission_state == "DRIVE_30M_POST_QR":
+            if getattr(node, 'distance_since_qr', 0.0) >= getattr(node, 'qr_stop_distance', 30.0):
+                node.mission_state = "STOPPED_AT_SOURCE"
+                node.qr_handshake_started = False
+            return NodeStatus.FAILURE
+
+        elif node.mission_state == "STOPPED_AT_SOURCE":
+            node.rover_move_manual_mode(0.0, 0.0)
+            if not getattr(node, 'qr_handshake_started', False):
+                node.comm_state = "SEND_QR"
+                node.qr_handshake_started = True
+            
+            if node.comm_state == "IDLE":
+                node.mission_state = "DRIVE_TO_DESTINATION"
+                node.qr_handshake_started = False
+                node.last_qr_data = None  # Clear so we wait for a NEW QR at destination
+            return NodeStatus.RUNNING
+
+        elif node.mission_state == "DRIVE_TO_DESTINATION":
+            if getattr(node, 'last_qr_data', None) is not None and node.comm_state == "IDLE":
+                node.mission_count += 1
+                if node.mission_count >= getattr(node, 'total_missions', 3):
+                    node.mission_state = "PARKED_TRANSITION"
+                else:
+                    node.mission_state = "DRIVE_TO_SOURCE"
+                node.last_qr_data = None  # Clear for next mission's source
+            return NodeStatus.FAILURE
+
+        elif node.mission_state == "PARKED_TRANSITION":
+            node.comm_state = "PARKED"
+            node.mission_state = "DONE"
+            return NodeStatus.RUNNING
+
+        elif node.mission_state == "DONE":
+            node.rover_move_manual_mode(0.0, 0.0)
+            return NodeStatus.RUNNING
 
         return NodeStatus.FAILURE
 
@@ -247,27 +309,50 @@ class NavigationAction(Behavior):
             return NodeStatus.RUNNING
             
         vectors = node.vectors
+        current_time = node.get_clock().now().nanoseconds / 1e9
+
+        # Fallback to stored last valid vectors if resuming from a stop and current vectors are empty
+        if (current_time - getattr(node, 'resume_from_stop_time', 0.0) < 3.0) and vectors.vector_count == 0 and getattr(node, 'last_valid_vectors', None) is not None:
+            vectors = node.last_valid_vectors
+            node.get_logger().info("Using stored last valid vectors post-stop to prevent collision", throttle_duration_sec=1.0)
+
         half_width = vectors.image_width / 2.0
-        target_speed = 0.5  # Normal speed
+        target_speed = 0.5
+        desired_dir = None
         raw_turn = 0.0
 
         if vectors.vector_count == 0:
             node.blind_frame_count += 1
+            # Immediately slow down to 0.2 when no lane is detected
             target_speed = 0.2
             target = getattr(node, 'current_target', None) or getattr(node, 'target_patient', None)
-            desired_dir = None
             if target and hasattr(node, 'sign_config_map') and target in node.sign_config_map:
                 desired_dir = node.sign_config_map[target]
                 node.get_logger().info(f"Intersection: Target '{target}' mapped to direction '{desired_dir}'", throttle_duration_sec=1.0)
             elif hasattr(node, 'last_detected_sign'):
                 desired_dir = node.last_detected_sign
 
-            if desired_dir in ["left", "Left"]:
-                raw_turn = 0.6
-            elif desired_dir in ["right", "Right"]:
-                raw_turn = -0.6
+            if desired_dir in ["left", "Left", "right", "Right"]:
+                # Kinematic turn calculation (Ackermann)
+                wheelbase = 0.3
+                turn_radius = 0.6  # Estimated center-lane turning radius for 90-degree intersection
+                delta = math.atan(wheelbase / turn_radius)
+                max_steer_angle = 0.5  # Physical steering limit in radians
+                kinematic_turn = delta / max_steer_angle
+                
+                if desired_dir in ["left", "Left"]:
+                    raw_turn = kinematic_turn
+                else:
+                    raw_turn = -kinematic_turn
             elif desired_dir in ["straight", "Straight", "up", "Up"]:
+                # --- Wide intersection fix ---
+                # Force a hard zero, override any residual smoothed_turn/lattice bias,
+                # and crawl even slower until lines reappear. Don't let the planner
+                # steer based on stale LiDAR data in an open crossing.
                 raw_turn = 0.0
+                target_speed = 0.2  # minimum speed of 0.2
+                node.smoothed_turn = 0.0  # snap-reset instead of blending — kills residual drift immediately
+                node.use_lattice_planner_override = True  # NEW flag, see below
             else:
                 # Safety-net fallback: we don't have a resolved direction, so hold the current smoothed turn steady
                 # rather than guessing a new direction, as this is now a rare edge case.
@@ -279,7 +364,7 @@ class NavigationAction(Behavior):
             error = deviation / half_width
             derivative = error - node.last_error
             raw_turn = (error * 1.2) + (derivative * 0.8)
-            target_speed = max(0.2, 0.5 - abs(error) * 0.4)
+            target_speed = max(0.3, 0.7 - abs(error) * 0.4)
             node.last_error = error
 
             # Track error history
@@ -297,7 +382,7 @@ class NavigationAction(Behavior):
             derivative = error - node.last_error
             raw_turn = (error * 1.5) + (derivative * 1.0)
             # Slow down slightly on curves to maintain smoothness at higher speeds
-            target_speed = max(0.2, 0.5 - abs(error) * 0.5)
+            target_speed = max(0.3, 0.7 - abs(error) * 0.5)
             node.last_error = error
 
             # Track error history
@@ -307,8 +392,20 @@ class NavigationAction(Behavior):
 
         # Higher alpha to reduce phase lag (which causes oscillations)
         alpha = 0.6
-        node.smoothed_turn = alpha * raw_turn + (1.0 - alpha) * node.smoothed_turn
+        if desired_dir not in ["straight", "Straight", "up", "Up"] or vectors.vector_count != 0:
+            node.smoothed_turn = alpha * raw_turn + (1.0 - alpha) * node.smoothed_turn
+            node.use_lattice_planner_override = False
         
+        # Intersection approach slow down
+        if getattr(node, 'sign_approach_start_time', 0.0) > 0.0:
+            if current_time - node.sign_approach_start_time > 1.0:
+                target_speed = min(target_speed, 0.2)
+                
+            # Reset if we are clear of the intersection (no signs for a while and have lines)
+            if current_time - getattr(node, 'last_sign_detection_time', 0.0) > 4.0 and vectors.vector_count > 0:
+                node.sign_approach_start_time = 0.0
+                node.last_detected_sign = None
+
         # Smooth the speed transition
         if not hasattr(node, 'smoothed_speed'):
             node.smoothed_speed = 0.5
@@ -316,7 +413,12 @@ class NavigationAction(Behavior):
 
         node.get_logger().info(f"Lane Tracking Error: {node.last_error:.2f} (midpoint deviation)", throttle_duration_sec=0.5)
 
-        planner_speed, planner_turn = node._run_lattice_planner(node.smoothed_turn, node.smoothed_speed)
+        if getattr(node, 'use_lattice_planner_override', False):
+            # Bypass lattice planner entirely during wide straight-through crossings —
+            # its obstacle avoidance can misfire on open cross-junction LiDAR returns.
+            planner_speed, planner_turn = node.smoothed_speed, 0.0
+        else:
+            planner_speed, planner_turn = node._run_lattice_planner(node.smoothed_turn, node.smoothed_speed)
             
         node.rover_move_manual_mode(planner_speed, planner_turn)
         return NodeStatus.RUNNING
@@ -330,6 +432,7 @@ class LineFollower(Node):
         self.subscription_server = self.create_subscription(ServerCommunication, '/ServerCommunication', self.server_communication_callback, QOS_PROFILE_DEFAULT)
         self.subscription_qr = self.create_subscription(String, '/qr_detection', self.qr_detection_callback, QOS_PROFILE_DEFAULT)
         self.subscription_signs = self.create_subscription(String, '/sign_board_detection', self.sign_board_callback, QOS_PROFILE_DEFAULT)
+        self.subscription_odom = self.create_subscription(Odometry, '/odom', self.odom_callback, QOS_PROFILE_DEFAULT)
 
         self.publisher_joy = self.create_publisher(Joy, '/cerebri/in/joy', QOS_PROFILE_DEFAULT)
         self.publisher_server = self.create_publisher(ServerCommunication, '/ServerCommunication', QOS_PROFILE_DEFAULT)
@@ -351,6 +454,10 @@ class LineFollower(Node):
         # NEW: smooths out speed drops when blind
         self.smoothed_speed = 0.5
         
+        # Stored vectors for resuming post-stop
+        self.last_valid_vectors = None
+        self.resume_from_stop_time = 0.0
+        
         self.show_lattice_window = True
         if self.show_lattice_window:
             cv2.namedWindow("Lattice Planner", cv2.WINDOW_NORMAL)
@@ -358,6 +465,8 @@ class LineFollower(Node):
 
         # Mission state variables
         self.last_detected_sign = None
+        self.sign_approach_start_time = 0.0
+        self.last_sign_detection_time = 0.0
         self.sign_config_map = {}
         self.target_patient = None
         self.comm_state = "IDLE"
@@ -365,6 +474,15 @@ class LineFollower(Node):
         self.last_processed_qr = None
         self.qr_drive_start_time = 0.0
         
+        # New MissionStateHandler state variables
+        self.mission_state = "INIT"
+        self.mission_count = 0
+        self.total_missions = 3
+        self.distance_since_qr = 0.0
+        self.last_odom_pos = None
+        self.qr_stop_distance = 30.0
+        self.qr_handshake_started = False
+
         # Server Comm Tracking
         self.uid_counter = 0
         self.last_sent_uid = 0
@@ -380,6 +498,7 @@ class LineFollower(Node):
                 Condition(lambda n: n.comm_state != "IDLE"),
                 HandleCommunication()
             ]),
+            MissionStateHandler(),
             OvertakeBehavior(),
             NavigationAction()
         ])
@@ -402,6 +521,8 @@ class LineFollower(Node):
 
     def edge_vectors_callback(self, message):
         self.vectors = message
+        if message.vector_count > 0:
+            self.last_valid_vectors = message
 
     def _run_lattice_planner(self, desired_steer, desired_speed=0.8):
         if not hasattr(self, 'latest_scan') or self.latest_scan is None:
@@ -541,13 +662,21 @@ class LineFollower(Node):
                 p1, p2 = best_path_points[i], best_path_points[i + 1]
                 cv2.line(vis_img, (int(250 - p1[1] * 100), int(500 - p1[0] * 100)),
                           (int(250 - p2[1] * 100), int(500 - p2[0] * 100)), (0, 200, 0), 2)
-            cv2.imshow("Lattice Planner", vis_img)
+            # cv2.imshow("Lattice Planner", vis_img)
             cv2.waitKey(1)
 
         return final_speed, best_steer
 
     def lidar_callback(self, message):
         self.latest_scan = message
+
+    def odom_callback(self, msg):
+        current_pos = msg.pose.pose.position
+        if getattr(self, 'last_odom_pos', None) is not None and getattr(self, 'mission_state', '') == "DRIVE_30M_POST_QR":
+            dx = current_pos.x - self.last_odom_pos.x
+            dy = current_pos.y - self.last_odom_pos.y
+            self.distance_since_qr += math.sqrt(dx*dx + dy*dy)
+        self.last_odom_pos = current_pos
 
     def server_communication_callback(self, message):
         if message.dest == 1:
@@ -577,6 +706,25 @@ class LineFollower(Node):
     def qr_detection_callback(self, message):
         qr_data = message.data
         if self.comm_state == "IDLE" and qr_data != self.last_processed_qr:
+            # --- Fake hospital / fake patient filter ---
+            target_to_loc = {
+                'A': 'PATIENT_1',
+                'B': 'PATIENT_2',
+                'C': 'PATIENT_3',
+                'X': 'HOSPITAL_1',
+                'Y': 'HOSPITAL_2',
+                'Z': 'HOSPITAL_3'
+            }
+            current_target = getattr(self, 'current_target', None)
+            
+            if current_target in target_to_loc:
+                expected_loc = target_to_loc[current_target]
+                # Check if the expected location string is within the JSON qr_data
+                if f"{{LOC: {expected_loc}}}" not in qr_data:
+                    self.get_logger().info(f"Ignoring fake QR: expected '{expected_loc}' for target '{current_target}', but got '{qr_data}'")
+                    self.last_processed_qr = qr_data
+                    return
+
             self.last_qr_data = qr_data
             self.last_processed_qr = qr_data
             self.qr_drive_start_time = self.get_clock().now().nanoseconds / 1e9
@@ -584,16 +732,21 @@ class LineFollower(Node):
             self.get_logger().info(f"QR Detected: {qr_data}. Driving for 2 more seconds.")
             
         # Optional: logic to detect parking spot
-        if qr_data == "PARKING" and self.comm_state == "IDLE":
+        if "PARKING" in qr_data and self.comm_state == "IDLE":
             self.comm_state = "PARKED"
 
     def sign_board_callback(self, message):
         if message.data:
             try:
                 payload = json.loads(message.data)
+                current_time = self.get_clock().now().nanoseconds / 1e9
                 if payload.get("detected") and len(payload.get("detections", [])) > 0:
-                    self.last_detected_sign = payload["detections"][0]["class"]
-                    self.get_logger().info(f"Stored detected sign: {self.last_detected_sign}")
+                    sign_class = payload["detections"][0]["class"]
+                    if sign_class != getattr(self, 'last_detected_sign', None) or getattr(self, 'sign_approach_start_time', 0.0) == 0.0:
+                        self.last_detected_sign = sign_class
+                        self.sign_approach_start_time = current_time
+                        self.get_logger().info(f"Stored detected sign: {self.last_detected_sign}, started approach timer")
+                    self.last_sign_detection_time = current_time
 
                 sign_config = payload.get("sign_config")
                 if sign_config:
@@ -630,7 +783,7 @@ class LineFollower(Node):
         if len(ranges[front_mask]) > 0 and np.min(ranges[front_mask]) > 1.2:
             # We also clear the visualization window so it doesn't freeze on old data
             if getattr(self, 'show_lattice_window', False):
-                cv2.imshow("Lattice Planner", np.ones((500, 500, 3), dtype=np.uint8) * 255)
+                # cv2.imshow("Lattice Planner", np.ones((500, 500, 3), dtype=np.uint8) * 255)
                 cv2.waitKey(1)
             return desired_speed, desired_steer
 
@@ -729,7 +882,7 @@ class LineFollower(Node):
             target_py = int(500 - (2.0 * math.cos(target_angle)) * 100)
             cv2.line(vis_img, (250, 500), (target_px, target_py), (0, 255, 0), 3)
             
-            cv2.imshow("Lattice Planner", vis_img)
+            # cv2.imshow("Lattice Planner", vis_img)
             cv2.waitKey(1)
 
         self.get_logger().info(f"FTG: Obstacle Avoided. Steer {best_steer:.2f}", throttle_duration_sec=0.5)

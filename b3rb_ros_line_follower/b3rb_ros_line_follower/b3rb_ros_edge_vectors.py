@@ -93,17 +93,11 @@ class EdgeVectorsPublisher(Node):
         return theta
 
     def compute_vectors_from_image(self, image, thresh):
-        """
-        Analyzes the binary threshold image and extracts left and right lane edge vectors.
-        """
         contours = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]
         cv2.drawContours(image, contours, -1, (255, 0, 0), 1)  # Draw all contours in blue
         vectors = []
         
         for i in range(len(contours)):
-            # FIX 1: Completely removed the cv2.contourArea() filter. 
-            # Tiny corner slivers often calculate to exactly 0.0 area.
-                
             coordinates = contours[i][:, 0, :]
             min_y_value = np.min(coordinates[:, 1])
             max_y_value = np.max(coordinates[:, 1])
@@ -111,15 +105,11 @@ class EdgeVectorsPublisher(Node):
             min_y_coords = np.array(coordinates[coordinates[:, 1] == min_y_value])
             max_y_coords = np.array(coordinates[coordinates[:, 1] == max_y_value])
 
-            # Fix for horizontal lines: select the leftmost point of the top edge and rightmost of the bottom edge.
-            # This ensures that for horizontal lines, magnitude equals their width rather than 0.0.
             min_y_coord = min_y_coords[np.argmin(min_y_coords[:, 0])].copy()
             max_y_coord = max_y_coords[np.argmax(max_y_coords[:, 0])].copy()
 
             magnitude = np.linalg.norm(min_y_coord - max_y_coord)
             
-            # Use VECTOR_MAGNITUDE_MINIMUM to filter out the 1-pixel noise specks that have ~0 magnitude.
-            # If magnitude >= 0 is used, 1-pixel noise specks steal the 'closest' spot and draw invisibly!
             if (magnitude > VECTOR_MAGNITUDE_MINIMUM):
                 rover_point = [self.image_width / 2, self.lower_image_height]
                 middle_point = (min_y_coord + max_y_coord) / 2
@@ -132,6 +122,35 @@ class EdgeVectorsPublisher(Node):
                     max_y_coord[0] = np.max(max_y_coords[:, 0])
 
                 vectors.append([list(min_y_coord), list(max_y_coord), distance])
+
+            # --- New Behavior: Corner Detection ---
+            # Kept original logic intact; this appends an extra, tighter vector for corners
+            epsilon = 0.01 * cv2.arcLength(contours[i], False)
+            approx = cv2.approxPolyDP(contours[i], epsilon, False)[:, 0, :]
+
+            if len(approx) >= 3:
+                rover_point_np = np.array([self.image_width / 2, self.lower_image_height])
+                best_seg, best_dist = None, float('inf')
+                for j in range(len(approx) - 1):
+                    p1, p2 = approx[j], approx[j + 1]
+                    mid = (p1 + p2) / 2.0
+                    dist = np.linalg.norm(mid - rover_point_np)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_seg = (p1, p2)
+                
+                if best_seg is not None:
+                    p1, p2 = best_seg
+                    if p1[1] <= p2[1]:
+                        c_min_y, c_max_y = p1.copy(), p2.copy()
+                    else:
+                        c_min_y, c_max_y = p2.copy(), p1.copy()
+                    
+                    c_magnitude = np.linalg.norm(c_min_y - c_max_y)
+                    if c_magnitude > VECTOR_MAGNITUDE_MINIMUM:
+                        c_middle = (c_min_y + c_max_y) / 2.0
+                        c_dist = np.linalg.norm(c_middle - rover_point_np)
+                        vectors.append([list(c_min_y), list(c_max_y), c_dist])
 
         return vectors, image
 
