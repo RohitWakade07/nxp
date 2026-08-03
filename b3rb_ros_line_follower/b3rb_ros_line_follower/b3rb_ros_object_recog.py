@@ -18,6 +18,7 @@ import os
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
+from synapse_msgs.msg import EdgeVectors
 import cv2
 import numpy as np
 
@@ -75,6 +76,18 @@ class ObjectRecognizer(Node):
             '/sign_board_detection',
             10)
 
+        # Subscription for edge vectors to track intersection state
+        self.subscription_vectors = self.create_subscription(
+            EdgeVectors,
+            '/edge_vectors',
+            self.edge_vectors_callback,
+            10)
+
+        self.sign_detected = False
+        self.first_detection_time = None
+        self.in_intersection = False
+        self.intersection_exit_ticks = 0
+
         self.model = None
         self.received_first_image = False
 
@@ -97,6 +110,19 @@ class ObjectRecognizer(Node):
 
         self.get_logger().info("Object Recognizer Node started. Waiting for images...")
 
+    def edge_vectors_callback(self, message):
+        if message.vector_count > 0:
+            if self.in_intersection:
+                self.intersection_exit_ticks += 1
+                if self.intersection_exit_ticks > 20:
+                    self.in_intersection = False
+                    self.sign_detected = False
+                    self.first_detection_time = None
+                    self.get_logger().info("Intersection cleared. Resuming model detection.")
+        elif message.vector_count == 0:
+            self.in_intersection = True
+            self.intersection_exit_ticks = 0
+
     def camera_image_callback(self, message):
         """Processes incoming camera frames to classify traffic signs."""
         if not self.received_first_image:
@@ -108,6 +134,17 @@ class ObjectRecognizer(Node):
         image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
         if image is None:
+            return
+
+        if self.sign_detected:
+            # Skip inference, display paused panel
+            orig_h, orig_w = image.shape[:2]
+            panel_width = 250
+            side_panel = np.ones((orig_h, panel_width, 3), dtype=np.uint8) * 255
+            cv2.putText(side_panel, "Detection Paused", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            combined_img = np.hstack((image, side_panel))
+            cv2.imshow("Sign Board Detection", combined_img)
+            cv2.waitKey(1)
             return
 
         payload = self.classify_sign(image)
@@ -122,6 +159,15 @@ class ObjectRecognizer(Node):
         y_offset = 60
 
         if payload is not None and payload.get("detected", False):
+            import time
+            current_time = time.time()
+            if self.first_detection_time is None:
+                self.first_detection_time = current_time
+                self.get_logger().info("First sign detection! Sampling frames for 1 second before pausing.")
+            elif current_time - self.first_detection_time >= 1.0:
+                self.sign_detected = True
+                self.get_logger().info("1 second of sampling complete. Pausing sign detection.")
+
             sign_config = self.get_sign_key_value_pairs(payload.get("detections", []))
             payload["sign_config"] = sign_config
 
@@ -154,7 +200,7 @@ class ObjectRecognizer(Node):
         # Combine original image and side panelata 
         combined_img = np.hstack((image, side_panel))
 
-        # cv2.imshow("Sign Board Detection", combined_img)
+        cv2.imshow("Sign Board Detection", combined_img)
         cv2.waitKey(1)
 
     def classify_sign(self, image):
@@ -226,14 +272,17 @@ class ObjectRecognizer(Node):
             best_arrow = None
             best_dist = float('inf')
             for arrow in arrows:
-                if abs(letter["cx"] - arrow["cx"]) <= 15 and arrow["cy"] > letter["cy"]:
-                    dist = arrow["cy"] - letter["cy"]
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_arrow = arrow["class"]
+                # Calculate 2D Euclidean distance squared
+                dist = (letter["cx"] - arrow["cx"])**2 + (letter["cy"] - arrow["cy"])**2
+                if dist < best_dist:
+                    best_dist = dist
+                    best_arrow = arrow["class"]
             
             if best_arrow:
                 pairings[letter["class"]] = best_arrow
+
+        if pairings:
+            self.get_logger().info(f"Paired sign elements: {pairings}")
 
         direction_map = {"Left": "left", "Right": "right", "Straight": "straight", "Up": "up"}
         sign_config = {
