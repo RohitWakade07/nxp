@@ -35,16 +35,16 @@ TURN_MAX = 1.0
 QOS_PROFILE_DEFAULT = 10
 
 # --- SPEED & ACCELERATION CONFIGURATION PARAMETERS ---
-TARGET_CRUISE_SPEED = 0.75         # was 0.5 — straight-line speed increase
-MIN_CORNER_SPEED = 0.22            # keep close to original; don't drop below what PD can track
-MAX_ACCEL_LIMIT = 2.5              # was 2.0 — allow reaching new cruise speed without lag
-SPEED_CURVE_SLOWDOWN_GAIN = 0.9    # was 0.5 — steeper falloff so curve speed doesn't rise with cruise speed
+TARGET_CRUISE_SPEED = 0.5          # Desired cruising speed on straight paths
+MIN_CORNER_SPEED = 0.2             # Minimum speed floor on sharp curves / slow maneuvers
+MAX_ACCEL_LIMIT = 2.0              # Maximum acceleration rate limit (units/sec^2)
+SPEED_CURVE_SLOWDOWN_GAIN = 0.5    # Speed reduction factor on curves based on steering error
 
 # --- LATTICE PLANNER CONFIGURATION PARAMETERS ---
 LATTICE_LOOKAHEAD_DT = 0.20        # Time step per simulation step (seconds)
 LATTICE_STEPS = 10                 # Total steps ahead (10 steps * 0.20s = 2.0s lookahead)
 LATTICE_WHEELBASE = 0.3            # Vehicle wheelbase (meters)
-LATTICE_LAT_ACCEL_MAX = 1.4        # Max lateral acceleration limit (m/s^2) for cornering speed calculation
+LATTICE_LAT_ACCEL_MAX = 1.2        # Max lateral acceleration limit (m/s^2) for cornering speed calculation
 LATTICE_NUM_CANDIDATES = 25        # Number of steering arc trajectories sampled between [-1.0, 1.0]
 LATTICE_MAX_STEER_ANGLE = 0.62     # Maximum physical steering angle (radians)
 LATTICE_COLLISION_RADIUS = 0.15    # Hard collision distance threshold (meters)
@@ -56,9 +56,13 @@ COST_OBSTACLE_BUFFER_DIST = 0.7    # Distance threshold (m) below which obstacle
 COST_OBSTACLE_WEIGHT = 5.0        # Weight multiplier for obstacle proximity penalty
 COST_OBSTACLE_DECAY = 6.0          # Exponential decay factor (higher value = passes closer/hugs obstacle)
 COST_TRACKING_LINEAR_WEIGHT = 10.0 # Weight for linear deviation from ideal line-following steering
-COST_TRACKING_QUAD_WEIGHT = 25.0   # Weight for quadratic deviation from ideal line-following steering
+COST_TRACKING_QUAD_WEIGHT = 15.0   # Weight for quadratic deviation from ideal line-following steering
 COST_SMOOTHNESS_WEIGHT = 3.0       # Weight for steering angle change from current steering state
 COST_DIRECTIONAL_BIAS_WEIGHT = 8.0 # Penalty weight for steering towards the side of the closest obstacle
+
+# --- REPULSIVE FORCE PARAMETERS ---
+REPULSIVE_FORCE_GAIN = 0.0        # Tuning gain for obstacle repulsion force
+REPULSIVE_LOOKAHEAD_DIST = 0     # Maximum distance to consider obstacles for repulsion
 
 class NodeStatus(Enum):
     SUCCESS = 1
@@ -101,11 +105,10 @@ class HandleCommunication(Behavior):
     def tick(self, node):
         if node.comm_state == "QR_DRIVE_DELAY":
             current_time = node.get_clock().now().nanoseconds / 1e9
-            if current_time - node.qr_drive_start_time >= 3.0:
-                node.is_hospital_zone = False
+            if current_time - node.qr_drive_start_time >= 2.0:
                 node.comm_state = "SEND_QR"
                 node.rover_move_manual_mode(0.0, 0.0)
-                node.get_logger().info("3 seconds passed, stopping and sending QR.")
+                node.get_logger().info("2 seconds passed, stopping and sending QR.")
             return NodeStatus.FAILURE
             
         elif node.comm_state == "SEND_QR":
@@ -278,57 +281,82 @@ class NavigationAction(Behavior):
         speed = 0.5  # Normal speed
         raw_turn = 0.0
 
-        # Hospital zone drive override - trust only LiDAR and go straight
-        in_hospital_zone = getattr(node, 'is_hospital_zone', False) and (node.comm_state == "QR_DRIVE_DELAY")
-        if in_hospital_zone:
-            speed = 0.4
-            planner_speed, planner_turn = node._run_lattice_planner(0.0, speed)
-            node.rover_move_manual_mode(planner_speed, planner_turn)
-            return NodeStatus.RUNNING
-
-        if vectors.vector_count > 0:
-            if getattr(node, 'in_intersection', False):
-                node.intersection_exit_ticks = getattr(node, 'intersection_exit_ticks', 0) + 1
-                if node.intersection_exit_ticks > 20:
-                    node.in_intersection = False
-                    node.sign_detected = False
-                    node.last_detected_sign = None
-                    node.get_logger().info("Intersection cleared. Resetting sign detection.")
-
         if vectors.vector_count == 0:
-            node.in_intersection = True
-            node.intersection_exit_ticks = 0
             speed = 0.2
-            target = getattr(node, 'current_target', None) or getattr(node, 'target_patient', None)
-            desired_dir = None
-            node.get_logger().info(f"DEBUG Intersection: target={target}, sign_config_map={getattr(node, 'sign_config_map', {})}")
-            if target and hasattr(node, 'sign_config_map') and target in node.sign_config_map:
-                desired_dir = node.sign_config_map[target]
-                node.get_logger().info(f"Intersection: Target '{target}' mapped to direction '{desired_dir}'")
-            elif hasattr(node, 'last_detected_sign'):
-                desired_dir = node.last_detected_sign
-                node.get_logger().info(f"Intersection: Fallback to last_detected_sign '{desired_dir}'")
 
-            if desired_dir in ["left", "Left"]:
-                raw_turn = 0.6
-            elif desired_dir in ["right", "Right"]:
-                raw_turn = -0.6
-            elif desired_dir in ["straight", "Straight", "up", "Up"]:
-                raw_turn = 0.0
-            else:
-                if node.last_error > 0.2:
-                    raw_turn = 0.6  # line is to the left, steer left to find it
-                elif node.last_error < -0.2:
-                    raw_turn = -0.6 # line is to the right, steer right to find it
+            # --- OBSTACLE AVOIDANCE WHEN NO LANE IS DETECTED ---
+            # Check if LiDAR sees an obstacle in the forward zone.
+            # If yes: treat lane as straight and use LiDAR repulsion to steer away.
+            lidar_obstacle_avoidance_active = False
+            if node.latest_scan is not None:
+                _scan = node.latest_scan
+                _angles = np.arange(_scan.angle_min, _scan.angle_max, _scan.angle_increment)
+                _ranges = np.array(_scan.ranges)
+                _min_len = min(len(_angles), len(_ranges))
+                _angles = _angles[:_min_len]
+                _ranges = _ranges[:_min_len]
+
+                # Only look at a narrow forward cone (±40°) for real obstacles
+                _fwd_mask = (_angles > -0.70) & (_angles < 0.70)
+                _fwd_ranges = _ranges[_fwd_mask]
+                _fwd_angles = _angles[_fwd_mask]
+
+                # Clean: ignore invalid readings
+                _valid = (_fwd_ranges > _scan.range_min) & (_fwd_ranges < 4.0) & ~np.isinf(_fwd_ranges)
+                _fwd_ranges = _fwd_ranges[_valid]
+                _fwd_angles = _fwd_angles[_valid]
+
+                if len(_fwd_ranges) > 0:
+                    _min_fwd_dist = float(np.min(_fwd_ranges))
+                    # Obstacle within 1.2 m triggers avoidance
+                    if _min_fwd_dist < 1.2:
+                        lidar_obstacle_avoidance_active = True
+                        # Compute a summed repulsive steer from all close front points
+                        _obs_x = _fwd_ranges * np.cos(_fwd_angles)
+                        _obs_y = _fwd_ranges * np.sin(_fwd_angles)
+                        _avoid_steer = 0.0
+                        for ox, oy in zip(_obs_x, _obs_y):
+                            _dist = max(0.1, math.sqrt(ox**2 + oy**2))
+                            _force = 0.15 / (_dist ** 2)
+                            if oy > 0:
+                                _avoid_steer -= _force  # obstacle left → steer right
+                            else:
+                                _avoid_steer += _force  # obstacle right → steer left
+                        _avoid_steer = max(-1.0, min(1.0, _avoid_steer))
+                        raw_turn = _avoid_steer
+                        speed = 0.25
+                        node.get_logger().info(
+                            f"No lane + obstacle at {_min_fwd_dist:.2f}m: LiDAR avoidance steer={_avoid_steer:.2f}",
+                            throttle_duration_sec=0.5)
+
+            if not lidar_obstacle_avoidance_active:
+                target = getattr(node, 'current_target', None) or getattr(node, 'target_patient', None)
+                desired_dir = None
+                if target and hasattr(node, 'sign_config_map') and target in node.sign_config_map:
+                    desired_dir = node.sign_config_map[target]
+                    node.get_logger().info(f"Intersection: Target '{target}' mapped to direction '{desired_dir}'", throttle_duration_sec=1.0)
+                elif hasattr(node, 'last_detected_sign'):
+                    desired_dir = node.last_detected_sign
+
+                if desired_dir in ["left", "Left"]:
+                    raw_turn = 0.6
+                elif desired_dir in ["right", "Right"]:
+                    raw_turn = -0.6
+                elif desired_dir in ["straight", "Straight", "up", "Up"]:
+                    raw_turn = 0.0
                 else:
-                    raw_turn = -0.5
+                    if node.last_error > 0.2:
+                        raw_turn = 0.6  # line is to the left, steer left to find it
+                    elif node.last_error < -0.2:
+                        raw_turn = -0.6 # line is to the right, steer right to find it
+                    else:
+                        raw_turn = -0.5
         elif vectors.vector_count == 1:
             deviation = vectors.vector_1[1].x - vectors.vector_1[0].x
             error = deviation / half_width
             derivative = error - node.last_error
             raw_turn = (error * 1.2) + (derivative * 0.8)
-            curvature_term = abs(derivative) * 1.5
-            speed = max(MIN_CORNER_SPEED, TARGET_CRUISE_SPEED - (abs(error) + curvature_term) * SPEED_CURVE_SLOWDOWN_GAIN)
+            speed = max(MIN_CORNER_SPEED, TARGET_CRUISE_SPEED - abs(error) * SPEED_CURVE_SLOWDOWN_GAIN)
             node.last_error = error
         elif vectors.vector_count == 2:
             # Pure Pursuit: Look-ahead point (top of the lane lines)
@@ -339,24 +367,58 @@ class NavigationAction(Behavior):
             error = deviation / half_width
             derivative = error - node.last_error
             raw_turn = (error * 1.5) + (derivative * 1.0)
-            
-            # curvature estimate: how fast error is changing, not just its magnitude
-            curvature_term = abs(derivative) * 1.5
-            speed = max(MIN_CORNER_SPEED,
-                        TARGET_CRUISE_SPEED - (abs(error) + curvature_term) * SPEED_CURVE_SLOWDOWN_GAIN)
+            # Slow down slightly on curves to maintain smoothness at higher speeds
+            speed = max(MIN_CORNER_SPEED, TARGET_CRUISE_SPEED - abs(error) * SPEED_CURVE_SLOWDOWN_GAIN)
             node.last_error = error
+
+        # Compute repulsive force from nearby obstacles
+        repulsive_steer_offset = 0.0
+        if node.latest_scan is not None:
+            scan = node.latest_scan
+            angles = np.arange(scan.angle_min, scan.angle_max, scan.angle_increment)
+            ranges = np.array(scan.ranges)
+            min_len = min(len(angles), len(ranges))
+            angles = angles[:min_len]
+            ranges = ranges[:min_len]
+
+            valid_idx = (ranges > scan.range_min) & (ranges < 4.0) & ~np.isinf(ranges)
+            valid_ranges = ranges[valid_idx]
+            valid_angles = angles[valid_idx]
+
+            obs_x = valid_ranges * np.cos(valid_angles)
+            obs_y = valid_ranges * np.sin(valid_angles)
+
+            # Filter to relevant track region
+            track_mask = (obs_x > 0.0) & (obs_x < LATTICE_TRACK_X_MAX) & (np.abs(obs_y) <= LATTICE_TRACK_Y_MAX)
+            obs_x = obs_x[track_mask]
+            obs_y = obs_y[track_mask]
+
+            if len(obs_x) > 0:
+                for ox, oy in zip(obs_x, obs_y):
+                    dist = math.sqrt(ox**2 + oy**2)
+                    if dist > 0.1 and dist < REPULSIVE_LOOKAHEAD_DIST:
+                        # Repulsive force points away from the obstacle
+                        # oy > 0 means obstacle on left -> steer right (negative turn)
+                        # oy < 0 means obstacle on right -> steer left (positive turn)
+                        force = REPULSIVE_FORCE_GAIN / (dist ** 2)
+                        if oy > 0:
+                            repulsive_steer_offset -= force
+                        else:
+                            repulsive_steer_offset += force
+                
+                # Cap the maximum contribution of repulsive steer offset
+                repulsive_steer_offset = max(-0.5, min(0.5, repulsive_steer_offset))
 
         # Higher alpha to reduce phase lag (which causes oscillations)
         alpha = 0.6
         node.smoothed_turn = alpha * raw_turn + (1.0 - alpha) * node.smoothed_turn
 
-        node.get_logger().info(f"Lane Tracking Error: {node.last_error:.2f} (midpoint deviation)", throttle_duration_sec=0.5)
+        # Add the repulsive force offset to the smoothed turn command
+        target_turn_command = max(-1.0, min(1.0, node.smoothed_turn + repulsive_steer_offset))
 
-        if vectors.vector_count == 0:
-            # Bypass lattice planner at intersections so it doesn't try to avoid the corner walls and ruin the turn
-            planner_speed, planner_turn = speed, node.smoothed_turn
-        else:
-            planner_speed, planner_turn = node._run_lattice_planner(node.smoothed_turn, speed)
+        node.get_logger().info(f"Lane Tracking Error: {node.last_error:.2f} (midpoint deviation), Repulsive Offset: {repulsive_steer_offset:.2f}", throttle_duration_sec=0.5)
+
+        planner_speed, planner_turn = node._run_lattice_planner(target_turn_command, speed)
             
         node.rover_move_manual_mode(planner_speed, planner_turn)
         return NodeStatus.RUNNING
@@ -389,13 +451,9 @@ class LineFollower(Node):
 
         # Mission state variables
         self.last_detected_sign = None
-        self.sign_detected = False
-        self.in_intersection = False
-        self.intersection_exit_ticks = 0
-        self.is_hospital_zone = False
         self.sign_config_map = {}
         self.target_patient = None
-        self.comm_state = "WAITING_TARGET"
+        self.comm_state = "IDLE"
         self.last_qr_data = None
         self.last_processed_qr = None
         self.qr_drive_start_time = 0.0
@@ -624,14 +682,7 @@ class LineFollower(Node):
             self.last_processed_qr = qr_data
             self.qr_drive_start_time = self.get_clock().now().nanoseconds / 1e9
             self.comm_state = "QR_DRIVE_DELAY"
-            
-            # Check if QR code is for the hospital
-            if "hospital" in qr_data.lower():
-                self.is_hospital_zone = True
-                self.get_logger().info(f"Hospital QR Detected: {qr_data}. Running 3s LiDAR-only straight mode.")
-            else:
-                self.is_hospital_zone = False
-                self.get_logger().info(f"QR Detected: {qr_data}. Driving for 3 more seconds.")
+            self.get_logger().info(f"QR Detected: {qr_data}. Driving for 2 more seconds.")
             
         # Optional: logic to detect parking spot
         if qr_data == "PARKING" and self.comm_state == "IDLE":
@@ -642,12 +693,8 @@ class LineFollower(Node):
             try:
                 payload = json.loads(message.data)
                 if payload.get("detected") and len(payload.get("detections", [])) > 0:
-                    # Only store direction arrows, not letters (A, B, C, X, Y, Z)
-                    DIRECTION_CLASSES = {"Left", "Right", "Straight", "Up"}
-                    for det in payload.get("detections", []):
-                        if det["class"] in DIRECTION_CLASSES:
-                            self.last_detected_sign = det["class"]
-                            self.get_logger().info(f"Stored detected sign direction: {self.last_detected_sign}")
+                    self.last_detected_sign = payload["detections"][0]["class"]
+                    self.get_logger().info(f"Stored detected sign: {self.last_detected_sign}")
 
                 sign_config = payload.get("sign_config")
                 if sign_config:
