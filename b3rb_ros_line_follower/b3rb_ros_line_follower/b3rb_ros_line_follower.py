@@ -35,10 +35,10 @@ TURN_MAX = 1.0
 QOS_PROFILE_DEFAULT = 10
 
 # --- SPEED & ACCELERATION CONFIGURATION PARAMETERS ---
-TARGET_CRUISE_SPEED = 0.75         # was 0.5 — straight-line speed increase
-MIN_CORNER_SPEED = 0.22            # keep close to original; don't drop below what PD can track
-MAX_ACCEL_LIMIT = 2.5              # was 2.0 — allow reaching new cruise speed without lag
-SPEED_CURVE_SLOWDOWN_GAIN = 1.2    # was 0.9 — steeper slowdown on curves to maintain tight tracking
+TARGET_CRUISE_SPEED = 0.5          # nominal speed on straight/normal lane tracking
+MIN_CORNER_SPEED = 0.2             # floor speed, never goes slower than this while actively tracking a lane
+MAX_ACCEL_LIMIT = 2.0              # caps how fast speed can ramp up or down per tick (units/sec²)
+SPEED_CURVE_SLOWDOWN_GAIN = 0.5    # how much speed is shaved off per unit of steering error
 
 # --- LATTICE PLANNER CONFIGURATION PARAMETERS ---
 LATTICE_LOOKAHEAD_DT = 0.20        # Time step per simulation step (seconds)
@@ -551,7 +551,7 @@ class NavigationAction(Behavior):
                     node.sign_detected = False
                     node.last_detected_sign = None
                     node.last_turn_clear_time = node.get_clock().now().nanoseconds / 1e9
-                    node.get_logger().info("Intersection cleared. Resetting sign detection and initiating 6s cooldown.")
+                    node.get_logger().info("Intersection cleared. Resetting sign detection and initiating 3s cooldown.")
 
         if in_hospital_memory:
             # In hospital zone (fake or real), use previous lane data when lanes are obstructed
@@ -645,8 +645,7 @@ class NavigationAction(Behavior):
             error = deviation / half_width
             derivative = error - node.last_error
             raw_turn = (error * 1.5) + (derivative * 1.0)
-            curvature_term = abs(derivative) * 2.0
-            speed = max(MIN_CORNER_SPEED, TARGET_CRUISE_SPEED - (abs(error) + curvature_term) * SPEED_CURVE_SLOWDOWN_GAIN)
+            speed = max(MIN_CORNER_SPEED, TARGET_CRUISE_SPEED - abs(error) * SPEED_CURVE_SLOWDOWN_GAIN)
             node.last_error = error
         elif vectors.vector_count == 2:
             # Pure Pursuit: Look-ahead point (top of the lane lines)
@@ -657,11 +656,7 @@ class NavigationAction(Behavior):
             error = deviation / half_width
             derivative = error - node.last_error
             raw_turn = (error * 1.8) + (derivative * 1.2)
-            
-            # curvature estimate: how fast error is changing, not just its magnitude
-            curvature_term = abs(derivative) * 2.0
-            speed = max(MIN_CORNER_SPEED,
-                        TARGET_CRUISE_SPEED - (abs(error) + curvature_term) * SPEED_CURVE_SLOWDOWN_GAIN)
+            speed = max(MIN_CORNER_SPEED, TARGET_CRUISE_SPEED - abs(error) * SPEED_CURVE_SLOWDOWN_GAIN)
             node.last_error = error
 
         if getattr(node, 'cone_detected', False):
@@ -1090,7 +1085,7 @@ class LineFollower(Node):
 
     def sign_board_callback(self, message):
         current_time = self.get_clock().now().nanoseconds / 1e9
-        if current_time - self.last_turn_clear_time < 6.0:
+        if current_time - self.last_turn_clear_time < 3.0:
             return
         if message.data:
             try:
