@@ -96,6 +96,24 @@ class EdgeVectorsPublisher(Node):
             cv2.resizeWindow("Perception Window - Edge Vectors", 1920, 1080)
             cv2.startWindowThread()
 
+        # Parking guide state (updated via /parking_guide_data topic)
+        self.parking_mission_state = 'IDLE'
+        self.parking_steer = 0.0
+        self.parking_speed = 0.0
+        self.subscription_parking_guide = self.create_subscription(
+            String,
+            '/parking_guide_data',
+            self._parking_guide_callback,
+            QOS_PROFILE_DEFAULT)
+
+        # Ackermann geometry constants (B3RB rover)
+        self.WHEELBASE_M    = 0.36   # front-to-rear axle distance (m)
+        self.TRACK_WIDTH_M  = 0.22   # left-to-right wheel separation (m)
+        # Camera intrinsics / calibration for bird-eye -> image projection
+        # These will be updated from the first received image
+        self._cam_h = 0
+        self._cam_w = 0
+
     def publish_debug_image(self, publisher, image):
         """Helper function to publish OpenCV debug images to ROS topics."""
         message = CompressedImage()
@@ -103,6 +121,177 @@ class EdgeVectorsPublisher(Node):
         message.format = "jpeg"
         message.data = encoded_data.tobytes()
         publisher.publish(message)
+
+    def _parking_guide_callback(self, msg):
+        try:
+            data = json.loads(msg.data)
+            self.parking_mission_state = data.get('mission_state', 'IDLE')
+            self.parking_steer = float(data.get('steer', 0.0))
+            self.parking_speed = float(data.get('speed', 0.0))
+        except Exception:
+            pass
+
+    def _draw_parking_guide_arcs(self, image, steer):
+        """
+        Project Ackermann steering arcs onto the camera image.
+
+        Physics:
+        --------
+        Given Ackermann geometry with wheelbase L and track width T:
+          - Turning radius at rear axle midpoint: R = L / tan(delta)
+            where delta = arctan(steer * STEER_MAX_RAD) (steering angle in radians)
+          - Left  inner wheel radius:  R_L = R - T/2
+          - Right outer wheel radius:  R_R = R + T/2
+          - Centre path:               R_C = R
+
+        3D to 2D projection:
+        ---------------------
+        We model the ground plane (z=0) with the camera mounted at height
+        h_cam above the ground, pitched down by angle phi. We use a homography
+        derived analytically from pin-hole camera geometry:
+
+          y_img = H - f_v * h_cam / (s * sin(phi) + y_gnd * cos(phi))
+          x_img = cx + f_u * x_gnd / (s * sin(phi) + y_gnd * cos(phi))
+
+        where:
+          s   = distance along ground from camera footprint to the arc point
+          f_u, f_v = estimated focal lengths (pixels)
+          cx, cy   = principal point (image centre)
+          phi      = camera downward pitch (radians)
+        """
+        H, W = image.shape[:2]
+        if H == 0 or W == 0:
+            return image
+
+        # --- Camera intrinsic estimates ---
+        fov_h_deg = 62.0          # horizontal FOV of NXP sim camera (degrees)
+        fov_v_deg = 48.0          # vertical FOV
+        f_u = W / (2.0 * math.tan(math.radians(fov_h_deg / 2.0)))
+        f_v = H / (2.0 * math.tan(math.radians(fov_v_deg / 2.0)))
+        cx = W / 2.0
+        cy = H / 2.0
+
+        # Camera mounting
+        h_cam = 0.25              # camera height above ground (m)
+        phi = math.radians(22.0) # camera downward pitch angle (degrees)
+
+        # --- Ackermann geometry ---
+        L = self.WHEELBASE_M
+        T = self.TRACK_WIDTH_M
+        STEER_MAX_RAD = math.radians(30.0)  # max physical steering angle
+        delta = steer * STEER_MAX_RAD       # steering angle (rad); +ve = left
+
+        MIN_ABS_STEER = 0.01
+        if abs(delta) < MIN_ABS_STEER:
+            # Straight-line arcs: three parallel lines
+            radii = None
+            offsets = [-T / 2.0, 0.0, T / 2.0]
+        else:
+            R = L / math.tan(abs(delta))    # unsigned turning radius (m)
+            sign = 1.0 if delta >= 0 else -1.0
+            # Left wheel, centreline, right wheel arcs
+            radii  = [sign * (R - T / 2.0), sign * R, sign * (R + T / 2.0)]
+            offsets = None
+
+        def ground_to_pixel(x_gnd, y_gnd):
+            """
+            x_gnd: lateral ground coord (+left from rover centreline)
+            y_gnd: longitudinal ground coord (+ forward from rear axle)
+            Returns (u, v) pixel or None if behind the image plane.
+            """
+            # Ground plane -> camera 3D
+            # X_cam = x_gnd, Y_cam = h_cam (height), Z_cam = y_gnd (depth)
+            denom = f_v * math.cos(phi) + (h_cam - 0.0) * math.sin(phi) / max(y_gnd, 0.01)
+            # Perspective: use pin-hole with pitch rotation
+            # For a down-pitched camera at height h with pitch phi:
+            #   image row from ground:  v = cy + f_v * (h_cam - z_floor * 0) / depth_proj
+            # Simplified analytical form:
+            depth = y_gnd * math.cos(phi) + h_cam * math.sin(phi)
+            if depth <= 0.05:
+                return None
+            v = int(cy + f_v * (h_cam * math.cos(phi) - y_gnd * math.sin(phi)) / depth)
+            u = int(cx - f_u * x_gnd / depth)   # negative: camera x grows right, rover x left
+            if 0 <= u < W and 0 <= v < H:
+                return (u, v)
+            return None
+
+        GUIDE_COLOR_LEFT   = (0,   200, 255)   # cyan-yellow
+        GUIDE_COLOR_CENTRE = (0,   255, 0)     # bright green  (centre path)
+        GUIDE_COLOR_RIGHT  = (0,   200, 255)   # same as left
+        GUIDE_ALPHA = 0.75
+        N_STEPS = 60                           # arc discretisation
+        Y_MAX   = 3.0                          # look-ahead distance (m)
+        Y_START = 0.05                         # start just ahead of rover
+
+        overlay = image.copy()
+
+        if radii is None:
+            # Straight paths
+            colors = [GUIDE_COLOR_LEFT, GUIDE_COLOR_CENTRE, GUIDE_COLOR_RIGHT]
+            widths = [2, 3, 2]
+            for off, col, wd in zip(offsets, colors, widths):
+                pts = []
+                for k in range(N_STEPS + 1):
+                    y_g = Y_START + (Y_MAX - Y_START) * k / N_STEPS
+                    px = ground_to_pixel(off, y_g)
+                    if px:
+                        pts.append(px)
+                for i in range(len(pts) - 1):
+                    cv2.line(overlay, pts[i], pts[i+1], col, wd, cv2.LINE_AA)
+        else:
+            colors = [GUIDE_COLOR_LEFT, GUIDE_COLOR_CENTRE, GUIDE_COLOR_RIGHT]
+            widths = [2, 3, 2]
+            for R_arc, col, wd in zip(radii, colors, widths):
+                pts = []
+                for k in range(N_STEPS + 1):
+                    # Arc angle from 0 (straight ahead)
+                    arc_len = Y_START + (Y_MAX - Y_START) * k / N_STEPS
+                    if abs(R_arc) < 0.01:
+                        continue
+                    theta = arc_len / R_arc   # angle swept (rad)
+                    # Ground coords: buggy starts at (0,0) heading +Y
+                    x_g = R_arc * (1.0 - math.cos(theta))   # lateral displacement
+                    y_g = abs(R_arc) * math.sin(abs(theta))  # forward displacement
+                    if y_g <= 0:
+                        continue
+                    px = ground_to_pixel(-x_g, y_g)
+                    if px:
+                        pts.append(px)
+                for i in range(len(pts) - 1):
+                    cv2.line(overlay, pts[i], pts[i+1], col, wd, cv2.LINE_AA)
+
+        # Draw dashed tick marks at 0.5m intervals on centre arc
+        tick_offsets = [-T / 2.0, T / 2.0]
+        for d in [0.5, 1.0, 1.5, 2.0, 2.5]:
+            tick_pts = []
+            for off in tick_offsets:
+                if radii is None:
+                    px = ground_to_pixel(off, d)
+                else:
+                    R_c = radii[1]
+                    if abs(R_c) > 0.01:
+                        theta_d = d / R_c
+                        x_g = R_c * (1.0 - math.cos(theta_d))
+                        y_g = abs(R_c) * math.sin(abs(theta_d))
+                        x_g_off = x_g + off * math.cos(theta_d)
+                        y_g_off = y_g - off * math.sin(theta_d) if R_c > 0 else y_g + off * math.sin(theta_d)
+                        px = ground_to_pixel(-x_g_off, y_g_off)
+                    else:
+                        px = ground_to_pixel(off, d)
+                if px:
+                    tick_pts.append(px)
+            if len(tick_pts) == 2:
+                cv2.line(overlay, tick_pts[0], tick_pts[1], (255, 255, 0), 2, cv2.LINE_AA)
+
+        # Blend overlay with original
+        cv2.addWeighted(overlay, GUIDE_ALPHA, image, 1.0 - GUIDE_ALPHA, 0, image)
+
+        # Label
+        direction = "LEFT" if steer > 0.02 else ("RIGHT" if steer < -0.02 else "STRAIGHT")
+        cv2.putText(image,
+                    f"PARKING GUIDE  [{direction}]  steer={steer:.2f}",
+                    (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+        return image
 
     def get_vector_angle_in_radians(self, vector):
         """Calculates the slope angle of a vector in radians."""
@@ -115,7 +304,6 @@ class EdgeVectorsPublisher(Node):
 
     def compute_vectors_from_image(self, image, thresh):
         contours = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]
-        cv2.drawContours(image, contours, -1, (255, 0, 0), 1)  # Draw all contours in blue
         vectors = []
         
         for i in range(len(contours)):
@@ -257,17 +445,8 @@ class EdgeVectorsPublisher(Node):
                 obs_right = True
                 label = "OBS RIGHT"
 
-            cv2.rectangle(upper, (x, y), (x + bw, y + bh), RED_COLOR, 2)
-            cv2.putText(upper, label, (x, max(10, y - 4)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, RED_COLOR, 2)
-
-        # Lane trust status overlay
-        trust_txt = (
-            f"LANE TRUST  L: {'OK' if not obs_left else 'BLOCKED'} "
-            f" R: {'OK' if not obs_right else 'BLOCKED'}"
-        )
-        cv2.putText(upper, trust_txt, (5, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+            # Bounding box and label text overlays removed for clean vector display
+            pass
 
         return obs_left, obs_right, upper
 
@@ -279,6 +458,67 @@ class EdgeVectorsPublisher(Node):
         self.lower_image_height = int(self.image_height * VECTOR_IMAGE_HEIGHT_PERCENTAGE)
         self.upper_image_height = int(self.image_height - self.lower_image_height)
 
+        if getattr(self, 'parking_mission_state', '') in ('PARKING_MANEUVER', 'SEEKING_PARK'):
+            # --- CONE VECTOR MODE ---
+            # Detect cones in the whole image to generate cone stretch lines
+            hsv_full = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+            lower_red1 = np.array([0, 70, 50])
+            upper_red1 = np.array([15, 255, 255])
+            mask1 = cv2.inRange(hsv_full, lower_red1, upper_red1)
+
+            lower_red2 = np.array([170, 70, 50])
+            upper_red2 = np.array([180, 255, 255])
+            mask2 = cv2.inRange(hsv_full, lower_red2, upper_red2)
+            
+            cone_mask = cv2.bitwise_or(mask1, mask2)
+            contours, _ = cv2.findContours(cone_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            cone_centers = []
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area > 100:
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    # Bottom center of the cone
+                    cone_centers.append((x + w/2, y + h))
+            
+            final_vectors = []
+            if len(cone_centers) > 0:
+                half_width = self.image_width / 2.0
+                left_cones = [c for c in cone_centers if c[0] < half_width]
+                right_cones = [c for c in cone_centers if c[0] >= half_width]
+                
+                origin_x = self.image_width / 2.0
+                origin_y = self.image_height
+                
+                if left_cones:
+                    left_cones.sort(key=lambda c: c[1], reverse=True) # Lowest first (closest)
+                    c = left_cones[0]
+                    final_vectors.append([[origin_x, origin_y], [c[0], c[1]]])
+                if right_cones:
+                    right_cones.sort(key=lambda c: c[1], reverse=True)
+                    c = right_cones[0]
+                    final_vectors.append([[origin_x, origin_y], [c[0], c[1]]])
+            
+            # --- Upper Zone (50% to 60%): color-agnostic obstacle detection ---
+            obs_left, obs_right, upper_vis = self._detect_upper_zone_obstacles(image)
+            self._obs_left  = obs_left
+            self._obs_right = obs_right
+
+            if getattr(self, 'show_perception_window', False):
+                full_debug_img = image.copy()
+                for v in final_vectors:
+                    cv2.line(full_debug_img, (int(v[0][0]), int(v[0][1])), (int(v[1][0]), int(v[1][1])), GREEN_COLOR, 3)
+                
+                # Only draw the guide arcs if we actually detected cones and generated final_vectors
+                if len(final_vectors) > 0:
+                    full_debug_img = self._draw_parking_guide_arcs(full_debug_img, self.parking_steer)
+                    
+                cv2.imshow("Perception Window - Edge Vectors", full_debug_img)
+                cv2.waitKey(1)
+
+            return final_vectors
+
+        # --- NORMAL LANE VECTOR MODE ---
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         
         # Mask out highly saturated colors (objects) to prevent them from being detected as dark lane lines
@@ -334,21 +574,11 @@ class EdgeVectorsPublisher(Node):
 
         if getattr(self, 'show_perception_window', False):
             full_debug_img = image.copy()
-            # Upper zone: annotated with obstacle boxes (50% to 60%)
-            start_y = int(self.image_height * 0.50)
-            full_debug_img[start_y:self.upper_image_height] = upper_vis
-            # Lower zone: lane vectors (60% to 100%)
+            # Overlay vector lines on the lower crop (60% to 100%)
             full_debug_img[self.upper_image_height:] = debug_img
-            # Separator line between obstacle zone and lane zone (at 60%)
-            cv2.line(full_debug_img,
-                     (0, self.upper_image_height),
-                     (self.image_width, self.upper_image_height),
-                     (0, 255, 255), 3)
-            # Separator line at top of obstacle zone (at 50%)
-            cv2.line(full_debug_img,
-                     (0, start_y),
-                     (self.image_width, start_y),
-                     (255, 0, 255), 2)
+            # Draw Ackermann parking guide arcs when parking maneuver is active
+            if getattr(self, 'parking_mission_state', '') in ('PARKING_MANEUVER', 'SEEKING_PARK'):
+                full_debug_img = self._draw_parking_guide_arcs(full_debug_img, self.parking_steer)
             cv2.imshow("Perception Window - Edge Vectors", full_debug_img)
             cv2.waitKey(1)
 

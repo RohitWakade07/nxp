@@ -75,6 +75,24 @@ PATIENT_LIFETIME_SEC = 60.0
 ZONE_TIMEOUT_SEC = 30.0
 MAX_COMM_RETRIES = 5
 
+# --- AUTO PARKING BEHAVIOR CONSTANTS ---
+PARKING_TRIGGER_HOSPITAL_COUNT = 3
+PARKING_APPROACH_SPEED = 0.1          # Slow crawl speed inside the bay
+PARKING_TURN_IN_SPEED  = 0.12         # Speed while turning into the bay
+PARKING_CORRIDOR_X_MAX = 1.5
+PARKING_CORRIDOR_Y_MAX = 0.6
+PARKING_STOP_FRONT_DIST = 0.35        # Stop when a wall/end-of-bay is this close ahead
+PARKING_CENTERING_GAIN = 2.5
+PARKING_MAX_STEER = 0.8
+PARKING_TIMEOUT_SEC = 30.0            # Increased timeout for 6s approach + turn + crawl
+PARKING_SIDE_DETECT_DIST = 1.5       # Max lateral LiDAR dist to detect the cone-row opening (m)
+PARKING_SIDE_ANGLE_L = 1.0           # Left side scan window start (rad, ~57°)
+PARKING_SIDE_ANGLE_R = 1.57          # Left side scan window end  (rad, ~90°)
+PARKING_TURN_IN_STEER = 0.85         # Full left Ackermann steer while turning into bay
+PARKING_APPROACH_SECS = 9.0         # Drive straight for 6 seconds to align and find cones
+PARKING_TURN_IN_SECS  = 2.0          # How long to hold the left-turn into the bay
+PARKING_STRAIGHTEN_SECS = 1.5        # After turning, straighten up inside bay
+
 class NodeStatus(Enum):
     SUCCESS = 1
     FAILURE = 2
@@ -247,9 +265,203 @@ class ServerDisconnectWatchdog(Behavior):
                 node.mission_state = "ABORT_DISCONNECTED"
         return NodeStatus.SUCCESS
 
+class ParkingBehavior(Behavior):
+    """
+    Multi-phase Ackermann parking maneuver.
+
+    The parking bay is on the LEFT side of the road.  The sequence is:
+
+      Phase 0 – APPROACH_SLOW
+        The buggy is still on the main road.  We use the LEFT-side LiDAR
+        sector (angles ~57°–90° from forward) to detect when a clear gap
+        (no cone closer than PARKING_SIDE_DETECT_DIST) appears, meaning we
+        have reached the mouth of the parking bay.  While searching we crawl
+        slowly forward (vision-based lane centering still running via the
+        EdgeVectors topic that was already published).
+
+      Phase 1 – TURN_IN
+        Apply maximum left Ackermann steering for PARKING_TURN_IN_SECS.
+        The rover describes a tight left arc off the road and into the bay.
+
+      Phase 2 – STRAIGHTEN
+        Release steering to 0 for PARKING_STRAIGHTEN_SECS so that the rover
+        is aligned with the bay corridor.
+
+      Phase 3 – CRAWL_IN
+        Drive straight ahead at PARKING_APPROACH_SPEED.  Use the LEFT/RIGHT
+        LiDAR corridor measurements to stay centred between the cone rows
+        (P-controller). Stop when the front LiDAR detects the end-of-bay wall
+        closer than PARKING_STOP_FRONT_DIST, or on timeout.
+    """
+
+    PHASE_APPROACH_SLOW = 0
+    PHASE_TURN_IN       = 1
+    PHASE_STRAIGHTEN    = 2
+    PHASE_CRAWL_IN      = 3
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.phase      = self.PHASE_APPROACH_SLOW
+        self.phase_start = None
+        self.start_time = None
+
+    def tick(self, node):
+        current_time = node.get_clock().now().nanoseconds / 1e9
+
+        # Global timer starts when tick() is first called
+        if self.start_time is None:
+            self.start_time = current_time
+            self.phase_start = current_time
+            node.get_logger().info("ParkingBehavior: starting — Phase 0 APPROACH_SLOW")
+
+        elapsed_total = current_time - self.start_time
+        elapsed_phase = current_time - (self.phase_start or current_time)
+
+        # --- Global failsafe timeout ---
+        if elapsed_total > PARKING_TIMEOUT_SEC:
+            node.rover_move_manual_mode(0.0, 0.0)
+            node.get_logger().warn("ParkingBehavior: Timeout — stopping as failsafe.")
+            self.reset()
+            return NodeStatus.SUCCESS
+
+        # --- LiDAR preprocessing (shared across phases) ---
+        scan = node.latest_scan
+        obs_x = obs_y = None
+        if scan is not None:
+            angles  = np.arange(scan.angle_min, scan.angle_max, scan.angle_increment)
+            ranges_ = np.array(scan.ranges)
+            n       = min(len(angles), len(ranges_))
+            angles, ranges_ = angles[:n], ranges_[:n]
+            valid   = (ranges_ > scan.range_min) & (ranges_ < 6.0) & ~np.isinf(ranges_)
+            r_v, a_v = ranges_[valid], angles[valid]
+            obs_x = r_v * np.cos(a_v)
+            obs_y = r_v * np.sin(a_v)
+
+        # ────────────────────────────────────────────────────────────────────
+        # Phase 0 — APPROACH_SLOW
+        #   Drive straight for 2 seconds (PARKING_APPROACH_SECS) to find/align with cones properly.
+        # ────────────────────────────────────────────────────────────────────
+        if self.phase == self.PHASE_APPROACH_SLOW:
+            if elapsed_phase < PARKING_APPROACH_SECS:
+                node.rover_move_manual_mode(PARKING_TURN_IN_SPEED, 0.0)
+                node.get_logger().info(
+                    f"ParkingBehavior Ph0 APPROACH_SLOW: driving straight to position t={elapsed_phase:.1f}s/{PARKING_APPROACH_SECS:.1f}s",
+                    throttle_duration_sec=0.5)
+            else:
+                self.phase = self.PHASE_TURN_IN
+                self.phase_start = current_time
+                node.get_logger().info("ParkingBehavior: Phase 0 complete — starting Phase 1 TURN_IN")
+            return NodeStatus.RUNNING
+
+        # ────────────────────────────────────────────────────────────────────
+        # Phase 1 — TURN_IN
+        #   Apply full left Ackermann steering to swing into the bay.
+        # ────────────────────────────────────────────────────────────────────
+        elif self.phase == self.PHASE_TURN_IN:
+            if elapsed_phase < PARKING_TURN_IN_SECS:
+                node.rover_move_manual_mode(PARKING_TURN_IN_SPEED, PARKING_TURN_IN_STEER)
+                node.get_logger().info(
+                    f"ParkingBehavior Ph1 TURN_IN: steer={PARKING_TURN_IN_STEER:.2f} t={elapsed_phase:.1f}s",
+                    throttle_duration_sec=0.5)
+            else:
+                self.phase = self.PHASE_STRAIGHTEN
+                self.phase_start = current_time
+                node.get_logger().info("ParkingBehavior: Phase 2 STRAIGHTEN")
+            return NodeStatus.RUNNING
+
+        # ────────────────────────────────────────────────────────────────────
+        # Phase 2 — STRAIGHTEN
+        #   Release steering so the rover lines up with the bay axis.
+        # ────────────────────────────────────────────────────────────────────
+        elif self.phase == self.PHASE_STRAIGHTEN:
+            if elapsed_phase < PARKING_STRAIGHTEN_SECS:
+                node.rover_move_manual_mode(PARKING_APPROACH_SPEED, 0.0)
+                node.get_logger().info(
+                    f"ParkingBehavior Ph2 STRAIGHTEN: t={elapsed_phase:.1f}s",
+                    throttle_duration_sec=0.5)
+            else:
+                self.phase = self.PHASE_CRAWL_IN
+                self.phase_start = current_time
+                node.get_logger().info("ParkingBehavior: Phase 3 CRAWL_IN")
+            return NodeStatus.RUNNING
+
+        # ────────────────────────────────────────────────────────────────────
+        # Phase 3 — CRAWL_IN
+        #   Slowly drive straight ahead into the bay, centred between cones.
+        #   Stop when the end-of-bay wall is close ahead.
+        # ────────────────────────────────────────────────────────────────────
+        elif self.phase == self.PHASE_CRAWL_IN:
+            # End-of-bay detection: obstacle dead ahead
+            if obs_x is not None:
+                front_mask = (
+                    (obs_x > 0.05) &
+                    (obs_x < PARKING_STOP_FRONT_DIST) &
+                    (np.abs(obs_y) < 0.35)
+                )
+                if np.any(front_mask):
+                    node.rover_move_manual_mode(0.0, 0.0)
+                    node.get_logger().info("ParkingBehavior: Front obstacle — PARKED!")
+                    self.reset()
+                    return NodeStatus.SUCCESS
+
+            # Corridor centering using LiDAR
+            steer = 0.0
+            if obs_x is not None:
+                corridor_mask = (
+                    (obs_x > 0.1) &
+                    (obs_x < PARKING_CORRIDOR_X_MAX) &
+                    (np.abs(obs_y) < PARKING_CORRIDOR_Y_MAX)
+                )
+                cy = obs_y[corridor_mask]
+                if len(cy) > 0:
+                    left_pts  = cy[cy > 0]
+                    right_pts = cy[cy < 0]
+                    left_dist  = np.min(left_pts)          if len(left_pts)  > 0 else PARKING_CORRIDOR_Y_MAX
+                    right_dist = np.min(np.abs(right_pts)) if len(right_pts) > 0 else PARKING_CORRIDOR_Y_MAX
+                    lateral_error = right_dist - left_dist
+                    steer = max(-PARKING_MAX_STEER,
+                                min(PARKING_MAX_STEER, lateral_error * PARKING_CENTERING_GAIN))
+
+            # Optionally override with vision-vector steering if cones are visible
+            vectors = node.vectors
+            if vectors is not None and vectors.vector_count > 0:
+                half_width = vectors.image_width / 2.0
+                raw_turn = 0.0
+                if vectors.vector_count == 2:
+                    mid_x_bottom = (vectors.vector_1[0].x + vectors.vector_2[0].x) / 2.0
+                    mid_x_top    = (vectors.vector_1[1].x + vectors.vector_2[1].x) / 2.0
+                    dx_mid = mid_x_top - mid_x_bottom
+                    dy_mid = ((vectors.vector_1[1].y + vectors.vector_2[1].y) / 2.0 -
+                              (vectors.vector_1[0].y + vectors.vector_2[0].y) / 2.0)
+                    if dy_mid != 0:
+                        raw_turn = math.atan2(dx_mid, -dy_mid)
+                elif vectors.vector_count == 1:
+                    dx = vectors.vector_1[1].x - vectors.vector_1[0].x
+                    dy = vectors.vector_1[1].y - vectors.vector_1[0].y
+                    if dy != 0:
+                        angle      = math.atan2(dx, -dy)
+                        offset_x   = vectors.vector_1[0].x - half_width
+                        raw_turn   = angle + (offset_x / half_width) * 0.5
+                vision_steer = max(-PARKING_MAX_STEER, min(PARKING_MAX_STEER, raw_turn * 2.0))
+                # Blend: 60% vision, 40% LiDAR centering
+                steer = 0.6 * vision_steer + 0.4 * steer
+
+            node.get_logger().info(
+                f"ParkingBehavior Ph3 CRAWL_IN: steer={steer:.2f} t={elapsed_phase:.1f}s",
+                throttle_duration_sec=0.5)
+            node.rover_move_manual_mode(PARKING_APPROACH_SPEED, steer)
+            return NodeStatus.RUNNING
+
+        # Fallback
+        node.rover_move_manual_mode(0.0, 0.0)
+        return NodeStatus.RUNNING
+
 class MissionController(Behavior):
     def __init__(self):
         self.patient_cycle = PatientCycleBehavior()
+        self.parking_behavior = ParkingBehavior()
         
     def tick(self, node):
         if node.mission_state == "ENTER_CITY":
@@ -286,10 +498,29 @@ class MissionController(Behavior):
             node.mission_state = "SEEKING_PARK"
             
         elif node.mission_state == "SEEKING_PARK":
+            # Take full motor control — stop letting NavigationAction drive straight.
+            # Slow down and look for the bay entrance with LiDAR; then
+            # hand off to ParkingBehavior once the gap is aligned.
             if node.in_zone == "PARKING":
+                # QR zone triggered — enter bay immediately
+                node.mission_state = "PARKING_MANEUVER"
+                node.get_logger().info("Parking zone QR reached. Handing off to ParkingBehavior.")
+                return NodeStatus.RUNNING
+            # While still seeking: ParkingBehavior Phase 0 handles the slow approach
+            # so we can reuse its gap-detection logic. Drive slowly forward.
+            status = self.parking_behavior.tick(node)
+            if status == NodeStatus.SUCCESS:
+                # Gap found and we entered — but wait for QR or just begin maneuver
+                node.mission_state = "PARKING_MANEUVER"
+                node.get_logger().info("Gap found by ParkingBehavior. Starting maneuver.")
+            return NodeStatus.RUNNING
+
+        elif node.mission_state == "PARKING_MANEUVER":
+            status = self.parking_behavior.tick(node)
+            if status == NodeStatus.SUCCESS:
                 node.mission_state = "PARKED"
-                node.rover_move_manual_mode(0.0, 0.0)
-                node.get_logger().info("Parked! Mission complete.")
+                node.get_logger().info("Parking maneuver complete. Mission finished.")
+            return NodeStatus.RUNNING
                 
         elif node.mission_state == "PARKED":
             node.rover_move_manual_mode(0.0, 0.0)
@@ -320,13 +551,13 @@ class PatientCycleBehavior(Behavior):
                     current_time = node.get_clock().now().nanoseconds / 1e9
                     if not hasattr(node, 'zone_stop_start_time') or node.zone_stop_start_time is None:
                         node.zone_stop_start_time = current_time
-                        node.get_logger().info(f"Target QR detected ({node.last_qr_read_data})! Driving for 5 seconds before stopping beside board...")
-                    elif current_time - node.zone_stop_start_time >= 5.0:
+                        node.get_logger().info(f"Target QR detected ({node.last_qr_read_data})! Driving for 10 seconds before stopping beside board...")
+                    elif current_time - node.zone_stop_start_time >= 10.0:
                         node.mission_state = "IN_PATIENT_ZONE"
                         node.zone_stop_start_time = None
                         node.send_server_msg(node.last_qr_read_data, is_ack=False)
                         node.get_logger().info(
-                            f"\033[1;32m[SERVER PUBLISH] Arrived at {node.current_patient_target} (QR={node.last_qr_read_data}) after 5s drive delay. Sent 1 report to server. Waiting for hospital assignment...\033[0m"
+                            f"\033[1;32m[SERVER PUBLISH] Arrived at {node.current_patient_target} (QR={node.last_qr_read_data}) after 10s drive delay. Sent 1 report to server. Waiting for hospital assignment...\033[0m"
                         )
                 else:
                     node.get_logger().info(
@@ -364,9 +595,10 @@ class PatientCycleBehavior(Behavior):
                         node.mission_state = "IN_HOSPITAL_ZONE"
                         node.patients_done += 1
                         node.zone_stop_start_time = None
+                        node.received_ack = False
                         node.send_server_msg(node.last_qr_read_data, is_ack=False)
                         node.get_logger().info(
-                            f"\033[1;32m[SERVER PUBLISH] Arrived at {node.current_hospital_target} (QR={node.last_qr_read_data}) after 7s drive delay. Sent 1 report to server. Patients done: {node.patients_done}. Waiting for next assignment...\033[0m"
+                            f"\033[1;32m[SERVER PUBLISH] Arrived at {node.current_hospital_target} (QR={node.last_qr_read_data}) after 7s drive delay. Sent 1 report to server. Patients done: {node.patients_done}. Waiting for server ACK...\033[0m"
                         )
                 else:
                     node.get_logger().info(
@@ -375,8 +607,28 @@ class PatientCycleBehavior(Behavior):
                     )
 
         elif node.mission_state == "IN_HOSPITAL_ZONE":
-            # Stay stopped. Server sends next patient letter (A/B/C) or 'DONE' / 'PARKING'
             node.rover_move_manual_mode(0.0, 0.0)
+            
+            # If 3rd hospital delivery completed, stay stopped and wait specifically for 'PARKING' command from server
+            if node.patients_done >= PARKING_TRIGGER_HOSPITAL_COUNT:
+                has_parking_target = node.received_target and node.received_target in ("DONE", "PARKING")
+                
+                if has_parking_target:
+                    node.received_ack = False
+                    node.received_target = None
+                    node.hospital_resume_straight = False
+                    node.mission_state = "EXITING"
+                    node.get_logger().info(
+                        f"{node.patients_done} hospitals completed and explicit 'PARKING' server message received. Heading to parking."
+                    )
+                    return NodeStatus.SUCCESS
+                else:
+                    node.get_logger().info(
+                        f"At hospital {node.patients_done}/{PARKING_TRIGGER_HOSPITAL_COUNT}. Waiting for 'PARKING' command from server...",
+                        throttle_duration_sec=2.0
+                    )
+                    return NodeStatus.RUNNING
+                
             if node.received_target:
                 raw = node.received_target
                 node.received_target = None
@@ -384,8 +636,9 @@ class PatientCycleBehavior(Behavior):
                 node.hospital_resume_straight = True
 
                 if raw in ("DONE", "PARKING"):
+                    node.hospital_resume_straight = False
                     node.mission_state = "EXITING"
-                    node.get_logger().info(f"Server sent '{raw}'. All patients served. Heading to park.")
+                    node.get_logger().info(f"Server sent '{raw}'. Immediately heading to park.")
                 else:
                     next_patient = SIGN_MAP.get(raw, raw)
                     node.current_patient_target = next_patient
@@ -777,6 +1030,7 @@ class LineFollower(Node):
 
         self.publisher_joy = self.create_publisher(Joy, '/cerebri/in/joy', QOS_PROFILE_DEFAULT)
         self.publisher_server = self.create_publisher(ServerCommunication, '/ServerCommunication', QOS_PROFILE_DEFAULT)
+        self.publisher_parking_guide = self.create_publisher(String, '/parking_guide_data', QOS_PROFILE_DEFAULT)
 
         self.target_speed = 0.0
         self.target_turn = 0.0
@@ -864,6 +1118,15 @@ class LineFollower(Node):
         is_overtaking = 1.0 if getattr(self, 'overtake_state', 'IDLE') != 'IDLE' else 0.0
         msg.axes = [0.0, self.target_speed, is_overtaking, self.target_turn]
         self.publisher_joy.publish(msg)
+
+        # Publish parking guide data so edge_vectors can draw Ackermann arc projections
+        guide_msg = String()
+        guide_msg.data = json.dumps({
+            'mission_state': self.mission_state,
+            'steer': float(self.target_turn),
+            'speed': float(self.target_speed),
+        })
+        self.publisher_parking_guide.publish(guide_msg)
 
     def rover_move_manual_mode(self, speed, turn):
         # Smoothly limit linear acceleration and deceleration

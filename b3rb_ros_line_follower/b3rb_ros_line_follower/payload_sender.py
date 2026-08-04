@@ -79,14 +79,15 @@ def main(args=None):
     # GUI Setup
     root = tk.Tk()
     root.title("Buggy Comm Center")
-    root.geometry("400x320")
+    root.geometry("480x360")
     root.configure(bg="#2c3e50")
 
     # Styling
     style = ttk.Style()
     style.theme_use('clam')
     style.configure('TButton', font=('Helvetica', 12, 'bold'), width=10)
-    style.configure('Ack.TButton', font=('Helvetica', 12, 'bold'), width=22, foreground="white", background="#27ae60")
+    style.configure('Ack.TButton', font=('Helvetica', 11, 'bold'), width=14, foreground="white", background="#27ae60")
+    style.configure('Park.TButton', font=('Helvetica', 11, 'bold'), width=14, foreground="white", background="#e67e22")
 
     # Title
     title_label = tk.Label(root, text="Buggy Communication Controller", font=("Helvetica", 14, "bold"), fg="#ecf0f1", bg="#2c3e50")
@@ -117,9 +118,15 @@ def main(args=None):
         btn = ttk.Button(grid_frame, text=f"Send {target}", command=lambda t=target: node.send_target(t))
         btn.grid(row=row, column=col, padx=8, pady=8)
 
-    # ACK Button (Larger, green button)
-    ack_btn = ttk.Button(root, text="Send ACK", style='Ack.TButton', command=node.send_ack)
-    ack_btn.pack(pady=10)
+    # Action Buttons Frame (ACK and PARKING)
+    action_frame = tk.Frame(root, bg="#2c3e50")
+    action_frame.pack(pady=10)
+
+    ack_btn = ttk.Button(action_frame, text="Send ACK", style='Ack.TButton', command=node.send_ack)
+    ack_btn.pack(side="left", padx=5)
+
+    park_btn = ttk.Button(action_frame, text="Send PARKING", style='Park.TButton', command=lambda: node.send_target('PARKING'))
+    park_btn.pack(side="right", padx=5)
 
     def on_closing():
         root.destroy()
