@@ -253,11 +253,17 @@ class MissionController(Behavior):
         
     def tick(self, node):
         if node.mission_state == "ENTER_CITY":
-            node.mission_state = "AWAITING_INITIAL_ASSIGNMENT"
-            node.get_logger().info("Mission Start: Waiting for initial target from server (send_target.py)")
+            initial_patient = node.received_target if node.received_target else 'A'
+            node.received_target = None
+            node.current_patient_target = SIGN_MAP.get(initial_patient, initial_patient)
+            node.current_target = node.current_patient_target
+            node.patient_spawn_time = node.get_clock().now().nanoseconds / 1e9
+            node.mission_state = "SEEKING_PATIENT"
+            node.get_logger().info(f"Mission Start: Default target '{initial_patient}' ({node.current_patient_target}). Navigating immediately.")
+            return NodeStatus.RUNNING
             
         elif node.mission_state == "AWAITING_INITIAL_ASSIGNMENT":
-            # Stay stopped; poll received_target set by server_communication_callback
+            # Fallback if state is manually set
             node.rover_move_manual_mode(0.0, 0.0)
             if node.received_target:
                 initial_patient = node.received_target
@@ -374,6 +380,8 @@ class PatientCycleBehavior(Behavior):
             if node.received_target:
                 raw = node.received_target
                 node.received_target = None
+                node.hospital_resume_time = node.get_clock().now().nanoseconds / 1e9
+                node.hospital_resume_straight = True
 
                 if raw in ("DONE", "PARKING"):
                     node.mission_state = "EXITING"
@@ -514,32 +522,65 @@ class OvertakeBehavior(Behavior):
 
 class NavigationAction(Behavior):
     def tick(self, node):
-        if node.vectors is None:
+        current_time = node.get_clock().now().nanoseconds / 1e9
+        resume_time = getattr(node, 'hospital_resume_time', 0.0)
+        vectors = node.vectors
+        if getattr(node, 'hospital_resume_straight', False):
+            if resume_time > 0.0 and (current_time - resume_time) < 4.0:
+                if vectors is None or vectors.vector_count == 0:
+                    # Construct virtual straight vectors so that the Lattice Planner and obstacle avoidance stay active
+                    from synapse_msgs.msg import EdgeVectors
+                    virtual_vectors = EdgeVectors()
+                    virtual_vectors.image_width = 640
+                    virtual_vectors.image_height = 480
+                    virtual_vectors.vector_count = 2
+                    
+                    # Left vector
+                    virtual_vectors.vector_1[0].x = 160.0
+                    virtual_vectors.vector_1[0].y = 0.0
+                    virtual_vectors.vector_1[1].x = 160.0
+                    virtual_vectors.vector_1[1].y = 480.0
+                    
+                    # Right vector
+                    virtual_vectors.vector_2[0].x = 480.0
+                    virtual_vectors.vector_2[0].y = 0.0
+                    virtual_vectors.vector_2[1].x = 480.0
+                    virtual_vectors.vector_2[1].y = 480.0
+                    
+                    vectors = virtual_vectors
+                    node.get_logger().info("Hospital resume: using virtual straight vectors", throttle_duration_sec=0.5)
+            else:
+                node.hospital_resume_straight = False
+                node.hospital_lane_memory_active = False
+
+        if vectors is None:
             node.rover_move_manual_mode(0.0, 0.0)
             return NodeStatus.RUNNING
-            
-        vectors = node.vectors
         half_width = vectors.image_width / 2.0
         speed = 0.5  # Normal speed
         raw_turn = 0.0
 
         if getattr(node, 'hospital_lane_memory_active', False):
-            if vectors.vector_count == 2:
-                dx1 = vectors.vector_1[1].x - vectors.vector_1[0].x
-                dy1 = vectors.vector_1[1].y - vectors.vector_1[0].y
-                mag1 = math.hypot(dx1, dy1)
-                
-                dx2 = vectors.vector_2[1].x - vectors.vector_2[0].x
-                dy2 = vectors.vector_2[1].y - vectors.vector_2[0].y
-                mag2 = math.hypot(dx2, dy2)
-                
-                crop_height = vectors.image_height * 0.40
-                confidence1 = (mag1 / crop_height) * 100.0 if crop_height > 0 else 0
-                confidence2 = (mag2 / crop_height) * 100.0 if crop_height > 0 else 0
-                
-                if confidence1 > 70.0 and confidence2 > 70.0:
-                    node.hospital_lane_memory_active = False
-                    node.get_logger().info(f"Both lanes > 40% confidence (L:{confidence1:.1f}%, R:{confidence2:.1f}%). Exiting memory mode.")
+            current_time = node.get_clock().now().nanoseconds / 1e9
+            resume_time = getattr(node, 'hospital_resume_time', 0.0)
+            # Irrespective of confidence, use memory mode for the first 3 seconds after resuming
+            if resume_time > 0.0 and (current_time - resume_time) >= 3.0:
+                if vectors.vector_count == 2:
+                    dx1 = vectors.vector_1[1].x - vectors.vector_1[0].x
+                    dy1 = vectors.vector_1[1].y - vectors.vector_1[0].y
+                    mag1 = math.hypot(dx1, dy1)
+                    
+                    dx2 = vectors.vector_2[1].x - vectors.vector_2[0].x
+                    dy2 = vectors.vector_2[1].y - vectors.vector_2[0].y
+                    mag2 = math.hypot(dx2, dy2)
+                    
+                    crop_height = vectors.image_height * 0.40
+                    confidence1 = (mag1 / crop_height) * 100.0 if crop_height > 0 else 0
+                    confidence2 = (mag2 / crop_height) * 100.0 if crop_height > 0 else 0
+                    
+                    if confidence1 > 70.0 and confidence2 > 70.0:
+                        node.hospital_lane_memory_active = False
+                        node.get_logger().info(f"Both lanes > 70% confidence (L:{confidence1:.1f}%, R:{confidence2:.1f}%). Exiting memory mode.")
 
         in_hospital_memory = getattr(node, 'hospital_lane_memory_active', False)
 
@@ -754,6 +795,9 @@ class LineFollower(Node):
         self.intersection_exit_ticks = 0
         self.is_hospital_zone = False
         self.last_turn_clear_time = 0.0
+        self.hospital_lane_memory_active = False
+        self.hospital_resume_time = 0.0
+        self.hospital_resume_straight = False
         
         # Debounce tracking for sign config
         self.current_sign_payload = None
