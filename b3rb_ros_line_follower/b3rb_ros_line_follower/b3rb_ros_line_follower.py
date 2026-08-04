@@ -21,7 +21,7 @@ import json
 import math
 import numpy as np
 import cv2
-from sensor_msgs.msg import Joy, LaserScan
+from sensor_msgs.msg import Joy, LaserScan, CompressedImage
 from std_msgs.msg import String
 from synapse_msgs.msg import EdgeVectors, ServerCommunication
 import subprocess
@@ -35,16 +35,16 @@ TURN_MAX = 1.0
 QOS_PROFILE_DEFAULT = 10
 
 # --- SPEED & ACCELERATION CONFIGURATION PARAMETERS ---
-TARGET_CRUISE_SPEED = 0.5          # Desired cruising speed on straight paths
-MIN_CORNER_SPEED = 0.2             # Minimum speed floor on sharp curves / slow maneuvers
-MAX_ACCEL_LIMIT = 2.0              # Maximum acceleration rate limit (units/sec^2)
-SPEED_CURVE_SLOWDOWN_GAIN = 0.5    # Speed reduction factor on curves based on steering error
+TARGET_CRUISE_SPEED = 0.75         # was 0.5 — straight-line speed increase
+MIN_CORNER_SPEED = 0.22            # keep close to original; don't drop below what PD can track
+MAX_ACCEL_LIMIT = 2.5              # was 2.0 — allow reaching new cruise speed without lag
+SPEED_CURVE_SLOWDOWN_GAIN = 1.2    # was 0.9 — steeper slowdown on curves to maintain tight tracking
 
 # --- LATTICE PLANNER CONFIGURATION PARAMETERS ---
 LATTICE_LOOKAHEAD_DT = 0.20        # Time step per simulation step (seconds)
 LATTICE_STEPS = 10                 # Total steps ahead (10 steps * 0.20s = 2.0s lookahead)
 LATTICE_WHEELBASE = 0.3            # Vehicle wheelbase (meters)
-LATTICE_LAT_ACCEL_MAX = 1.2        # Max lateral acceleration limit (m/s^2) for cornering speed calculation
+LATTICE_LAT_ACCEL_MAX = 1.4        # Max lateral acceleration limit (m/s^2) for cornering speed calculation
 LATTICE_NUM_CANDIDATES = 25        # Number of steering arc trajectories sampled between [-1.0, 1.0]
 LATTICE_MAX_STEER_ANGLE = 0.62     # Maximum physical steering angle (radians)
 LATTICE_COLLISION_RADIUS = 0.15    # Hard collision distance threshold (meters)
@@ -53,16 +53,27 @@ LATTICE_TRACK_Y_MAX = 0.40         # Lateral width filter limit for track obstac
 
 # --- COST FUNCTION PARAMETERS ("OBSTACLE HUGGING" & TRAJECTORY TUNING) ---
 COST_OBSTACLE_BUFFER_DIST = 0.7    # Distance threshold (m) below which obstacle proximity cost is applied
-COST_OBSTACLE_WEIGHT = 5.0        # Weight multiplier for obstacle proximity penalty
+COST_OBSTACLE_WEIGHT = 50.0        # Weight multiplier for obstacle proximity penalty
 COST_OBSTACLE_DECAY = 6.0          # Exponential decay factor (higher value = passes closer/hugs obstacle)
-COST_TRACKING_LINEAR_WEIGHT = 10.0 # Weight for linear deviation from ideal line-following steering
-COST_TRACKING_QUAD_WEIGHT = 15.0   # Weight for quadratic deviation from ideal line-following steering
+COST_TRACKING_LINEAR_WEIGHT = 40.0 # Weight for linear deviation from ideal line-following steering (was 10.0)
+COST_TRACKING_QUAD_WEIGHT = 120.0  # Weight for quadratic deviation from ideal line-following steering (was 25.0)
 COST_SMOOTHNESS_WEIGHT = 3.0       # Weight for steering angle change from current steering state
 COST_DIRECTIONAL_BIAS_WEIGHT = 8.0 # Penalty weight for steering towards the side of the closest obstacle
 
 # --- REPULSIVE FORCE PARAMETERS ---
 REPULSIVE_FORCE_GAIN = 0.0        # Tuning gain for obstacle repulsion force
 REPULSIVE_LOOKAHEAD_DIST = 0     # Maximum distance to consider obstacles for repulsion
+
+# --- MISSION CONSTANTS ---
+SIGN_MAP = {
+    'A': 'PATIENT_1', 'B': 'PATIENT_2', 'C': 'PATIENT_3',
+    'X': 'HOSPITAL_1', 'Y': 'HOSPITAL_2', 'Z': 'HOSPITAL_3',
+    'PATIENT_1': 'A', 'PATIENT_2': 'B', 'PATIENT_3': 'C',
+    'HOSPITAL_1': 'X', 'HOSPITAL_2': 'Y', 'HOSPITAL_3': 'Z',
+}
+PATIENT_LIFETIME_SEC = 60.0
+ZONE_TIMEOUT_SEC = 30.0
+MAX_COMM_RETRIES = 5
 
 class NodeStatus(Enum):
     SUCCESS = 1
@@ -103,18 +114,32 @@ class Condition(Behavior):
 
 class HandleCommunication(Behavior):
     def tick(self, node):
+        current_time = node.get_clock().now().nanoseconds / 1e9
+        
         if node.comm_state == "QR_DRIVE_DELAY":
-            current_time = node.get_clock().now().nanoseconds / 1e9
-            if current_time - node.qr_drive_start_time >= 2.0:
+            if current_time - node.qr_drive_start_time >= 12.0:
+                node.is_hospital_zone = False
                 node.comm_state = "SEND_QR"
+                node.comm_msg_to_send = node.last_qr_data
                 node.rover_move_manual_mode(0.0, 0.0)
-                node.get_logger().info("2 seconds passed, stopping and sending QR.")
+                
+                if node.vectors and node.vectors.vector_count > 0:
+                    half_width = node.vectors.image_width / 2.0
+                    if node.vectors.vector_count == 2:
+                        lane_center = (node.vectors.vector_1[0].x + node.vectors.vector_2[0].x) / 2.0
+                        node.last_error = (half_width - lane_center) / half_width
+                    elif node.vectors.vector_count == 1:
+                        deviation = node.vectors.vector_1[1].x - node.vectors.vector_1[0].x
+                        node.last_error = deviation / half_width
+                
+                node.get_logger().info("12 seconds passed, stopping to send QR.")
             return NodeStatus.FAILURE
             
         elif node.comm_state == "SEND_QR":
-            node.send_server_msg(node.last_qr_data, is_ack=False)
+            node.send_server_msg(node.comm_msg_to_send, is_ack=False)
             node.comm_state = "WAITING_ACK"
-            node.get_logger().info(f"Sent QR {node.last_qr_data}, waiting for ACK")
+            node.comm_last_send_time = current_time
+            node.get_logger().info(f"Sent {node.comm_msg_to_send}, waiting for ACK")
             node.rover_move_manual_mode(0.0, 0.0)
             return NodeStatus.RUNNING
             
@@ -123,18 +148,35 @@ class HandleCommunication(Behavior):
             if node.received_ack:
                 node.comm_state = "WAITING_TARGET"
                 node.received_ack = False
+                node.comm_retry_count = 0
+                node.comm_last_send_time = current_time
                 node.get_logger().info("Received ACK, waiting for target")
+            elif current_time - node.comm_last_send_time > 1.0:
+                node.comm_retry_count += 1
+                node.comm_state = "SEND_QR"
+                node.get_logger().warn(f"Comm Retry {node.comm_retry_count}/5")
             return NodeStatus.RUNNING
             
         elif node.comm_state == "WAITING_TARGET":
             node.rover_move_manual_mode(0.0, 0.0)
             if node.received_target is not None:
-                node.send_server_msg("", is_ack=True, req_uid=node.last_uid)
-                node.current_target = node.received_target
-                node.received_target = None
-                node.comm_state = "IDLE"
-                node.get_logger().info(f"Received target {node.current_target}, resuming navigation")
-                return NodeStatus.SUCCESS
+                if node.last_uid not in node.uid_to_mission_state:
+                    # ACK the server; keep received_target for MissionController to consume
+                    node.send_server_msg("", is_ack=True, req_uid=node.last_uid)
+                    node.uid_to_mission_state.add(node.last_uid)
+                    node.comm_state = "IDLE"  # MissionController reads received_target on next tick
+                    node.comm_retry_count = 0
+                    node.get_logger().info(f"Received target '{node.received_target}' from server, ACK sent")
+                    return NodeStatus.SUCCESS
+                else:
+                    # Duplicate UID — ACK again and discard
+                    node.send_server_msg("", is_ack=True, req_uid=node.last_uid)
+                    node.received_target = None
+                    node.get_logger().warn(f"Duplicate UID {node.last_uid} ignored")
+            elif current_time - node.comm_last_send_time > 5.0:
+                node.comm_retry_count += 1
+                node.comm_state = "SEND_QR"
+                node.get_logger().warn("WAITING_TARGET timeout, retrying send")
             return NodeStatus.RUNNING
             
         elif node.comm_state == "PARKED":
@@ -142,6 +184,7 @@ class HandleCommunication(Behavior):
             if not node.sent_parked:
                 node.send_server_msg("PARKED", is_ack=False)
                 node.sent_parked = True
+                node.comm_last_send_time = current_time
                 node.get_logger().info("Sent PARKED, waiting for OK")
             
             if node.received_target == "OK":
@@ -150,12 +193,211 @@ class HandleCommunication(Behavior):
             elif node.received_target == "INVALID":
                 node.get_logger().error("Parking INVALID!")
                 node.comm_state = "DONE"
+            elif current_time - node.comm_last_send_time > 1.0:
+                 node.sent_parked = False
+                 node.comm_retry_count += 1
             return NodeStatus.RUNNING
             
         elif node.comm_state == "DONE":
             node.rover_move_manual_mode(0.0, 0.0)
             return NodeStatus.SUCCESS
 
+        return NodeStatus.FAILURE
+            
+
+class WatchdogParallel(Behavior):
+    def __init__(self, children):
+        self.children = children
+    def tick(self, node):
+        for child in self.children:
+            child.tick(node)
+        return NodeStatus.SUCCESS  # Must return SUCCESS so Sequence continues to navigation
+
+class TimingWatchdog(Behavior):
+    def tick(self, node):
+        if node.mission_state in ["SEEKING_PATIENT", "IN_PATIENT_ZONE", "AWAITING_ASSIGNMENT"]:
+            current_time = node.get_clock().now().nanoseconds / 1e9
+            if node.patient_spawn_time > 0 and (current_time - node.patient_spawn_time) > PATIENT_LIFETIME_SEC:
+                node.get_logger().error(f"TimingWatchdog: Patient {node.current_patient_target} expired! Penalty.")
+                node.penalties.append({"type": "time_expired", "target": node.current_patient_target, "time": current_time})
+                node.patient_spawn_time = current_time  # Reset for now so it doesn't spam
+        return NodeStatus.SUCCESS
+
+class ZoneExitWatchdog(Behavior):
+    def tick(self, node):
+        if node.in_zone is not None:
+            current_time = node.get_clock().now().nanoseconds / 1e9
+            # Fake zone exit based on time if we haven't seen a QR in 12 seconds
+            if current_time - node.zone_entry_time > 12.0:
+                old_zone = node.in_zone
+                node.in_zone = None
+                node.get_logger().info(f"ZoneExitWatchdog: Exited zone {old_zone}")
+                
+                # Check for penalties
+                if node.mission_state == "AWAITING_ASSIGNMENT":
+                    node.get_logger().error("Penalty: Exited PATIENT zone before assignment received!")
+                    node.penalties.append({"type": "early_exit", "zone": old_zone, "time": current_time})
+        return NodeStatus.SUCCESS
+
+class ServerDisconnectWatchdog(Behavior):
+    def tick(self, node):
+        if node.comm_retry_count >= MAX_COMM_RETRIES:
+            if node.mission_state != "ABORT_DISCONNECTED":
+                node.get_logger().error("ServerDisconnectWatchdog: Comm retries exceeded. Aborting mission!")
+                node.mission_state = "ABORT_DISCONNECTED"
+        return NodeStatus.SUCCESS
+
+class MissionController(Behavior):
+    def __init__(self):
+        self.patient_cycle = PatientCycleBehavior()
+        
+    def tick(self, node):
+        if node.mission_state == "ENTER_CITY":
+            node.mission_state = "AWAITING_INITIAL_ASSIGNMENT"
+            node.get_logger().info("Mission Start: Waiting for initial target from server (send_target.py)")
+            
+        elif node.mission_state == "AWAITING_INITIAL_ASSIGNMENT":
+            # Stay stopped; poll received_target set by server_communication_callback
+            node.rover_move_manual_mode(0.0, 0.0)
+            if node.received_target:
+                initial_patient = node.received_target
+                node.received_target = None
+                node.current_patient_target = SIGN_MAP.get(initial_patient, initial_patient)
+                node.current_target = node.current_patient_target
+                node.patient_spawn_time = node.get_clock().now().nanoseconds / 1e9
+                node.mission_state = "SEEKING_PATIENT"
+                node.get_logger().info(f"Initial target '{initial_patient}' -> navigating to {node.current_patient_target}")
+            return NodeStatus.RUNNING
+            
+        elif node.mission_state in [
+            "SEEKING_PATIENT", "IN_PATIENT_ZONE",
+            "SEEKING_HOSPITAL", "IN_HOSPITAL_ZONE"
+        ]:
+            return self.patient_cycle.tick(node)
+            
+        elif node.mission_state == "EXITING":
+            node.get_logger().info("All patients served. Heading to parking zone...", throttle_duration_sec=5.0)
+            node.mission_state = "SEEKING_PARK"
+            
+        elif node.mission_state == "SEEKING_PARK":
+            if node.in_zone == "PARKING":
+                node.mission_state = "PARKED"
+                node.rover_move_manual_mode(0.0, 0.0)
+                node.get_logger().info("Parked! Mission complete.")
+                
+        elif node.mission_state == "PARKED":
+            node.rover_move_manual_mode(0.0, 0.0)
+            return NodeStatus.RUNNING
+                
+        elif node.mission_state == "MISSION_DONE":
+            node.rover_move_manual_mode(0.0, 0.0)
+            return NodeStatus.RUNNING
+            
+        elif node.mission_state == "ABORT_DISCONNECTED":
+            node.rover_move_manual_mode(0.0, 0.0)
+            return NodeStatus.RUNNING
+            
+        return NodeStatus.FAILURE
+
+class PatientCycleBehavior(Behavior):
+    """Purely server-directed mission cycle.
+    The buggy navigates, detects zones via QR, stops, and waits for send_target.py
+    to send the next assignment. No automatic sends to the server.
+    """
+    def tick(self, node):
+        if node.mission_state == "SEEKING_PATIENT":
+            # Tell NavigationAction which building to head to
+            node.current_target = node.current_patient_target
+            # Arrived when zone flips to PATIENT and the QR matches our target
+            if node.in_zone == "PATIENT" and node.last_qr_read_data:
+                if node.current_patient_target in node.last_qr_read_data:
+                    current_time = node.get_clock().now().nanoseconds / 1e9
+                    if not hasattr(node, 'zone_stop_start_time') or node.zone_stop_start_time is None:
+                        node.zone_stop_start_time = current_time
+                        node.get_logger().info(f"Target QR detected ({node.last_qr_read_data})! Driving for 5 seconds before stopping beside board...")
+                    elif current_time - node.zone_stop_start_time >= 5.0:
+                        node.mission_state = "IN_PATIENT_ZONE"
+                        node.zone_stop_start_time = None
+                        node.send_server_msg(node.last_qr_read_data, is_ack=False)
+                        node.get_logger().info(
+                            f"\033[1;32m[SERVER PUBLISH] Arrived at {node.current_patient_target} (QR={node.last_qr_read_data}) after 5s drive delay. Sent 1 report to server. Waiting for hospital assignment...\033[0m"
+                        )
+                else:
+                    node.get_logger().info(
+                        f"Wrong patient zone QR: '{node.last_qr_read_data}' "
+                        f"(wanted {node.current_patient_target}). Continuing."
+                    )
+
+        elif node.mission_state == "IN_PATIENT_ZONE":
+            # Stay stopped and wait for the server to send a hospital letter (X/Y/Z)
+            node.rover_move_manual_mode(0.0, 0.0)
+            if node.received_target:
+                raw = node.received_target
+                node.received_target = None
+                # Map letter -> canonical target (e.g. X -> HOSPITAL_1)
+                hospital = SIGN_MAP.get(raw, raw)
+                node.current_hospital_target = hospital
+                node.current_target = hospital
+                node.in_zone = None
+                node.last_qr_read_data = None
+                node.last_processed_qr = None
+                node.mission_state = "SEEKING_HOSPITAL"
+                node.get_logger().info(f"Hospital assigned by server: '{raw}' -> {hospital}. Navigating.")
+            return NodeStatus.RUNNING
+
+        elif node.mission_state == "SEEKING_HOSPITAL":
+            node.current_target = node.current_hospital_target
+            # Arrived when zone flips to HOSPITAL and QR matches
+            if node.in_zone == "HOSPITAL" and node.last_qr_read_data:
+                if node.current_hospital_target in node.last_qr_read_data:
+                    current_time = node.get_clock().now().nanoseconds / 1e9
+                    if not hasattr(node, 'zone_stop_start_time') or node.zone_stop_start_time is None:
+                        node.zone_stop_start_time = current_time
+                        node.get_logger().info(f"Target QR detected ({node.last_qr_read_data})! Driving for 7 seconds before stopping beside hospital...")
+                    elif current_time - node.zone_stop_start_time >= 7.0:
+                        node.mission_state = "IN_HOSPITAL_ZONE"
+                        node.patients_done += 1
+                        node.zone_stop_start_time = None
+                        node.send_server_msg(node.last_qr_read_data, is_ack=False)
+                        node.get_logger().info(
+                            f"\033[1;32m[SERVER PUBLISH] Arrived at {node.current_hospital_target} (QR={node.last_qr_read_data}) after 7s drive delay. Sent 1 report to server. Patients done: {node.patients_done}. Waiting for next assignment...\033[0m"
+                        )
+                else:
+                    node.get_logger().info(
+                        f"Wrong hospital zone QR: '{node.last_qr_read_data}' "
+                        f"(wanted {node.current_hospital_target}). Continuing."
+                    )
+
+        elif node.mission_state == "IN_HOSPITAL_ZONE":
+            # Stay stopped. Server sends next patient letter (A/B/C) or 'DONE' / 'PARKING'
+            node.rover_move_manual_mode(0.0, 0.0)
+            if node.received_target:
+                raw = node.received_target
+                node.received_target = None
+
+                if raw in ("DONE", "PARKING"):
+                    node.mission_state = "EXITING"
+                    node.get_logger().info(f"Server sent '{raw}'. All patients served. Heading to park.")
+                else:
+                    next_patient = SIGN_MAP.get(raw, raw)
+                    node.current_patient_target = next_patient
+                    node.current_target = next_patient
+                    node.in_zone = None
+                    node.last_qr_read_data = None
+                    node.last_processed_qr = None
+                    node.patient_spawn_time = node.get_clock().now().nanoseconds / 1e9
+                    node.mission_state = "SEEKING_PATIENT"
+                    node.get_logger().info(f"Next patient from server: '{raw}' -> {next_patient}. Navigating.")
+            return NodeStatus.RUNNING
+
+        return NodeStatus.FAILURE
+
+class ZoneGuard(Behavior):
+    def __init__(self, expected_zone):
+        self.expected_zone = expected_zone
+    def tick(self, node):
+        if node.in_zone == self.expected_zone:
+            return NodeStatus.SUCCESS
         return NodeStatus.FAILURE
 
 class OvertakeBehavior(Behavior):
@@ -281,7 +523,46 @@ class NavigationAction(Behavior):
         speed = 0.5  # Normal speed
         raw_turn = 0.0
 
-        if vectors.vector_count == 0:
+        if getattr(node, 'hospital_lane_memory_active', False):
+            if vectors.vector_count == 2:
+                dx1 = vectors.vector_1[1].x - vectors.vector_1[0].x
+                dy1 = vectors.vector_1[1].y - vectors.vector_1[0].y
+                mag1 = math.hypot(dx1, dy1)
+                
+                dx2 = vectors.vector_2[1].x - vectors.vector_2[0].x
+                dy2 = vectors.vector_2[1].y - vectors.vector_2[0].y
+                mag2 = math.hypot(dx2, dy2)
+                
+                crop_height = vectors.image_height * 0.40
+                confidence1 = (mag1 / crop_height) * 100.0 if crop_height > 0 else 0
+                confidence2 = (mag2 / crop_height) * 100.0 if crop_height > 0 else 0
+                
+                if confidence1 > 70.0 and confidence2 > 70.0:
+                    node.hospital_lane_memory_active = False
+                    node.get_logger().info(f"Both lanes > 40% confidence (L:{confidence1:.1f}%, R:{confidence2:.1f}%). Exiting memory mode.")
+
+        in_hospital_memory = getattr(node, 'hospital_lane_memory_active', False)
+
+        if vectors.vector_count > 0:
+            if getattr(node, 'in_intersection', False):
+                node.intersection_exit_ticks = getattr(node, 'intersection_exit_ticks', 0) + 1
+                if node.intersection_exit_ticks > 20:
+                    node.in_intersection = False
+                    node.sign_detected = False
+                    node.last_detected_sign = None
+                    node.last_turn_clear_time = node.get_clock().now().nanoseconds / 1e9
+                    node.get_logger().info("Intersection cleared. Resetting sign detection and initiating 6s cooldown.")
+
+        if in_hospital_memory:
+            # In hospital zone (fake or real), use previous lane data when lanes are obstructed
+            # until both side lanes are detected again with > 80 magnitude.
+            error = node.last_error
+            derivative = 0.0
+            raw_turn = (error * 1.5)
+            speed = 0.4
+        elif vectors.vector_count == 0:
+            node.in_intersection = True
+            node.intersection_exit_ticks = 0
             speed = 0.2
 
             # --- OBSTACLE AVOIDANCE WHEN NO LANE IS DETECTED ---
@@ -332,18 +613,26 @@ class NavigationAction(Behavior):
             if not lidar_obstacle_avoidance_active:
                 target = getattr(node, 'current_target', None) or getattr(node, 'target_patient', None)
                 desired_dir = None
-                if target and hasattr(node, 'sign_config_map') and target in node.sign_config_map:
-                    desired_dir = node.sign_config_map[target]
-                    node.get_logger().info(f"Intersection: Target '{target}' mapped to direction '{desired_dir}'", throttle_duration_sec=1.0)
-                elif hasattr(node, 'last_detected_sign'):
+                target_key = SIGN_MAP.get(target, target)
+                node.get_logger().info(f"DEBUG Intersection: target={target} (key={target_key}), sign_config_map={getattr(node, 'sign_config_map', {})}")
+                if target_key and hasattr(node, 'sign_config_map') and target_key in node.sign_config_map:
+                    desired_dir = node.sign_config_map[target_key]
+                    node.get_logger().info(f"Intersection: Target '{target}' mapped to direction '{desired_dir}'")
+                elif hasattr(node, 'last_detected_sign') and node.last_detected_sign is not None:
                     desired_dir = node.last_detected_sign
+                    node.get_logger().info(f"Intersection: Fallback to last_detected_sign '{desired_dir}'")
 
                 if desired_dir in ["left", "Left"]:
                     raw_turn = 0.6
                 elif desired_dir in ["right", "Right"]:
                     raw_turn = -0.6
                 elif desired_dir in ["straight", "Straight", "up", "Up"]:
-                    raw_turn = 0.0
+                    if getattr(node, 'in_zone', None) is None and not getattr(node, 'hospital_lane_memory_active', False):
+                        # Steer 3 degrees counter-clockwise (left) (~0.08 normalized turn) to find the path at a cross section
+                        raw_turn = 0.08
+                        node.get_logger().info("Intersection (Straight): Steering 3 degrees left to find lane", throttle_duration_sec=0.5)
+                    else:
+                        raw_turn = 0.0
                 else:
                     if node.last_error > 0.2:
                         raw_turn = 0.6  # line is to the left, steer left to find it
@@ -355,8 +644,9 @@ class NavigationAction(Behavior):
             deviation = vectors.vector_1[1].x - vectors.vector_1[0].x
             error = deviation / half_width
             derivative = error - node.last_error
-            raw_turn = (error * 1.2) + (derivative * 0.8)
-            speed = max(MIN_CORNER_SPEED, TARGET_CRUISE_SPEED - abs(error) * SPEED_CURVE_SLOWDOWN_GAIN)
+            raw_turn = (error * 1.5) + (derivative * 1.0)
+            curvature_term = abs(derivative) * 2.0
+            speed = max(MIN_CORNER_SPEED, TARGET_CRUISE_SPEED - (abs(error) + curvature_term) * SPEED_CURVE_SLOWDOWN_GAIN)
             node.last_error = error
         elif vectors.vector_count == 2:
             # Pure Pursuit: Look-ahead point (top of the lane lines)
@@ -366,10 +656,18 @@ class NavigationAction(Behavior):
             deviation = half_width - lane_center
             error = deviation / half_width
             derivative = error - node.last_error
-            raw_turn = (error * 1.5) + (derivative * 1.0)
-            # Slow down slightly on curves to maintain smoothness at higher speeds
-            speed = max(MIN_CORNER_SPEED, TARGET_CRUISE_SPEED - abs(error) * SPEED_CURVE_SLOWDOWN_GAIN)
+            raw_turn = (error * 1.8) + (derivative * 1.2)
+            
+            # curvature estimate: how fast error is changing, not just its magnitude
+            curvature_term = abs(derivative) * 2.0
+            speed = max(MIN_CORNER_SPEED,
+                        TARGET_CRUISE_SPEED - (abs(error) + curvature_term) * SPEED_CURVE_SLOWDOWN_GAIN)
             node.last_error = error
+
+        if getattr(node, 'cone_detected', False):
+            raw_turn = 0.0
+            speed = 0.4
+            node.get_logger().info("Cone detected! Going straight.", throttle_duration_sec=0.5)
 
         # Compute repulsive force from nearby obstacles
         repulsive_steer_offset = 0.0
@@ -418,7 +716,11 @@ class NavigationAction(Behavior):
 
         node.get_logger().info(f"Lane Tracking Error: {node.last_error:.2f} (midpoint deviation), Repulsive Offset: {repulsive_steer_offset:.2f}", throttle_duration_sec=0.5)
 
-        planner_speed, planner_turn = node._run_lattice_planner(target_turn_command, speed)
+        if vectors.vector_count == 0 and not in_hospital_memory:
+            # Bypass lattice planner at intersections so it doesn't try to avoid the corner walls and ruin the turn
+            planner_speed, planner_turn = speed, target_turn_command
+        else:
+            planner_speed, planner_turn = node._run_lattice_planner(target_turn_command, speed)
             
         node.rover_move_manual_mode(planner_speed, planner_turn)
         return NodeStatus.RUNNING
@@ -432,6 +734,10 @@ class LineFollower(Node):
         self.subscription_server = self.create_subscription(ServerCommunication, '/ServerCommunication', self.server_communication_callback, QOS_PROFILE_DEFAULT)
         self.subscription_qr = self.create_subscription(String, '/qr_detection', self.qr_detection_callback, QOS_PROFILE_DEFAULT)
         self.subscription_signs = self.create_subscription(String, '/sign_board_detection', self.sign_board_callback, QOS_PROFILE_DEFAULT)
+        self.subscription_camera = self.create_subscription(CompressedImage, '/camera/image_raw/compressed', self.camera_callback, QOS_PROFILE_DEFAULT)
+
+        self.cone_detected = False
+        self.cone_detected_time = 0.0
 
         self.publisher_joy = self.create_publisher(Joy, '/cerebri/in/joy', QOS_PROFILE_DEFAULT)
         self.publisher_server = self.create_publisher(ServerCommunication, '/ServerCommunication', QOS_PROFILE_DEFAULT)
@@ -444,14 +750,40 @@ class LineFollower(Node):
         self.smoothed_turn = 0.0
         self.last_error = 0.0
         
-        self.show_lattice_window = True
-        if self.show_lattice_window:
-            cv2.namedWindow("Lattice Planner", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("Lattice Planner", 400, 400)
+        self.show_lattice_window = False  # Disabled: imshow at 20Hz kills RTF significantly
 
         # Mission state variables
         self.last_detected_sign = None
+        self.sign_detected = False
+        self.in_intersection = False
+        self.intersection_exit_ticks = 0
+        self.is_hospital_zone = False
+        self.last_turn_clear_time = 0.0
+        
+        # Debounce tracking for sign config
+        self.current_sign_payload = None
+        self.current_sign_payload_count = 0
+        self.payload_locked = False
+        
         self.sign_config_map = {}
+        
+        # Blackboard
+        self.mission_state = "ENTER_CITY"
+        self.patients_done = 0
+        self.current_patient_target = None
+        self.current_hospital_target = None
+        self.in_zone = None
+        self.zone_entry_time = 0.0
+        self.patient_spawn_time = 0.0
+        self.penalties = []
+        self.bonus_awarded = False
+        
+        self.comm_retry_count = 0
+        self.uid_to_mission_state = set()
+        self.comm_msg_to_send = ""
+        self.comm_last_send_time = 0.0
+        self.last_qr_read_data = None
+
         self.target_patient = None
         self.comm_state = "IDLE"
         self.last_qr_data = None
@@ -468,16 +800,21 @@ class LineFollower(Node):
         self.sent_parked = False
 
         # Behavior Tree Root
-        self.bt_root = Selector([
-            Sequence([
-                Condition(lambda n: n.comm_state != "IDLE"),
-                HandleCommunication()
+        # HandleCommunication is NOT in the Selector — all server messages come from
+        # send_target.py manually. The buggy only listens via server_communication_callback.
+        self.bt_root = Sequence([
+            WatchdogParallel([
+                TimingWatchdog(),
+                ZoneExitWatchdog(),
+                ServerDisconnectWatchdog()
             ]),
-            # OvertakeBehavior(),  # Disabled S-curve overtake behavior for now
-            NavigationAction()
+            Selector([
+                MissionController(),
+                NavigationAction()
+            ])
         ])
 
-        self.control_timer = self.create_timer(0.05, self.tick_bt_and_publish)
+        self.control_timer = self.create_timer(0.1, self.tick_bt_and_publish)  # 10Hz — enough for smooth control, avoids heavy 20Hz CPU load
         self.get_logger().info("Line Follower initialized. Behavior Tree Active.")
 
     def tick_bt_and_publish(self):
@@ -549,6 +886,12 @@ class LineFollower(Node):
 
         min_cost = float('inf')
         best_steer = desired_steer
+        
+        in_hospital_memory = getattr(self, 'hospital_lane_memory_active', False)
+        obstacle_w = COST_OBSTACLE_WEIGHT
+        tracking_lin_w = COST_TRACKING_LINEAR_WEIGHT
+        tracking_quad_w = COST_TRACKING_QUAD_WEIGHT
+
         best_path_points = None
         best_obs_dist = float('inf')
         best_speed = desired_speed
@@ -594,11 +937,11 @@ class LineFollower(Node):
             
             # Soft Obstacle Penalty (Allows obstacle hugging / close passing based on parameters)
             if min_path_dist < COST_OBSTACLE_BUFFER_DIST:
-                cost += COST_OBSTACLE_WEIGHT * math.exp(-COST_OBSTACLE_DECAY * (min_path_dist - LATTICE_COLLISION_RADIUS))
+                cost += obstacle_w * math.exp(-COST_OBSTACLE_DECAY * (min_path_dist - LATTICE_COLLISION_RADIUS))
 
             # Tracking Penalty (deviation from ideal lane keeping)
             steer_diff = abs(cand_steer - desired_steer)
-            cost += COST_TRACKING_LINEAR_WEIGHT * steer_diff + COST_TRACKING_QUAD_WEIGHT * (steer_diff ** 2)
+            cost += tracking_lin_w * steer_diff + tracking_quad_w * (steer_diff ** 2)
 
             # Smoothness Penalty (deviation from current actuator state)
             cost += COST_SMOOTHNESS_WEIGHT * abs(cand_steer - self.target_turn)
@@ -647,6 +990,37 @@ class LineFollower(Node):
 
         return final_speed, best_steer
 
+    def camera_callback(self, message):
+        np_arr = np.frombuffer(message.data, np.uint8)
+        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if image is None:
+            return
+
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+        # Red/Dark Orange color bounds (for simulated traffic cones)
+        lower_red1 = np.array([0, 70, 50])
+        upper_red1 = np.array([15, 255, 255])
+        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+
+        lower_red2 = np.array([170, 70, 50])
+        upper_red2 = np.array([180, 255, 255])
+        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+
+        mask = cv2.bitwise_or(mask1, mask2)
+
+        h, w = mask.shape
+        roi = mask[h // 2 :, :]  # only lower half of image
+        orange_pixels = cv2.countNonZero(roi)
+
+        current_time = self.get_clock().now().nanoseconds / 1e9
+        if orange_pixels > 500:
+            self.cone_detected = True
+            self.cone_detected_time = current_time
+        else:
+            if current_time - getattr(self, 'cone_detected_time', 0.0) > 0.5:
+                self.cone_detected = False
+
     def lidar_callback(self, message):
         self.latest_scan = message
 
@@ -676,30 +1050,73 @@ class LineFollower(Node):
         self.publisher_server.publish(server_msg)
 
     def qr_detection_callback(self, message):
-        qr_data = message.data
-        if self.comm_state == "IDLE" and qr_data != self.last_processed_qr:
+        try:
+            payload = json.loads(message.data)
+            qr_data = payload.get("data", message.data)
+        except json.JSONDecodeError:
+            qr_data = message.data
+            
+        current_time = self.get_clock().now().nanoseconds / 1e9
+        
+        # Only accept QR data if it matches our assigned mission target
+        current_target = getattr(self, 'current_target', None)
+        target_key = SIGN_MAP.get(current_target, current_target) if current_target else None
+        
+        # Match either canonical target (e.g. HOSPITAL_1) or target key (e.g. X) in QR payload
+        is_assigned_target = False
+        if current_target and (current_target in qr_data or (target_key and target_key in qr_data)):
+            is_assigned_target = True
+        elif "PARKING" in qr_data and self.mission_state == "EXITING":
+            is_assigned_target = True
+
+        if is_assigned_target and qr_data != self.last_processed_qr:
             self.last_qr_data = qr_data
             self.last_processed_qr = qr_data
-            self.qr_drive_start_time = self.get_clock().now().nanoseconds / 1e9
-            self.comm_state = "QR_DRIVE_DELAY"
-            self.get_logger().info(f"QR Detected: {qr_data}. Driving for 2 more seconds.")
+            self.last_qr_read_data = qr_data
+            self.zone_entry_time = current_time
             
-        # Optional: logic to detect parking spot
-        if qr_data == "PARKING" and self.comm_state == "IDLE":
-            self.comm_state = "PARKED"
+            if "hospital" in qr_data.lower() or "X" in qr_data or "Y" in qr_data or "Z" in qr_data:
+                self.in_zone = "HOSPITAL"
+                self.is_hospital_zone = True
+                self.hospital_lane_memory_active = True
+                self.get_logger().info(f"Entered ASSIGNED HOSPITAL zone: {qr_data}")
+            elif "A" in qr_data or "B" in qr_data or "C" in qr_data:
+                self.in_zone = "PATIENT"
+                self.get_logger().info(f"Entered ASSIGNED PATIENT zone: {qr_data}")
+            elif "PARKING" in qr_data:
+                self.in_zone = "PARKING"
+                self.get_logger().info(f"Entered PARKING zone: {qr_data}")
+            # PatientCycleBehavior manages comm_state; do NOT override it here
 
     def sign_board_callback(self, message):
+        current_time = self.get_clock().now().nanoseconds / 1e9
+        if current_time - self.last_turn_clear_time < 6.0:
+            return
         if message.data:
             try:
                 payload = json.loads(message.data)
                 if payload.get("detected") and len(payload.get("detections", [])) > 0:
-                    self.last_detected_sign = payload["detections"][0]["class"]
-                    self.get_logger().info(f"Stored detected sign: {self.last_detected_sign}")
+                    # Only store direction arrows, not letters (A, B, C, X, Y, Z)
+                    DIRECTION_CLASSES = {"Left", "Right", "Straight", "Up"}
+                    for det in payload.get("detections", []):
+                        if det["class"] in DIRECTION_CLASSES and det.get("confidence", 1.0) >= 0.65:
+                            self.last_detected_sign = det["class"]
+                            self.get_logger().info(f"Stored detected sign direction: {self.last_detected_sign} (conf: {det.get('confidence', 1.0):.2f})")
 
                 sign_config = payload.get("sign_config")
                 if sign_config:
-                    self.sign_config_map.update(sign_config)
-                    self.get_logger().info(f"Stored sign_config map: {self.sign_config_map}")
+                    if self.current_sign_payload == sign_config:
+                        if not self.payload_locked:
+                            self.current_sign_payload_count += 1
+                            if self.current_sign_payload_count >= 10:
+                                self.payload_locked = True
+                                self.sign_config_map.update(sign_config)
+                                self.get_logger().info(f"Locked in sign_config map after 10 consistent reads: {self.sign_config_map}")
+                    else:
+                        self.current_sign_payload = sign_config
+                        self.current_sign_payload_count = 1
+                        self.payload_locked = False
+                        self.get_logger().info(f"Sign variation detected, reset count for: {sign_config}")
             except Exception as e:
                 self.get_logger().error(f"Failed to parse sign board data: {e}")
 

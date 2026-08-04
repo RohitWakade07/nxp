@@ -20,6 +20,9 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 import cv2
 import numpy as np
+import time
+
+from synapse_msgs.msg import ServerCommunication
 
 # ROS 2 package path resolver
 from ament_index_python.packages import get_package_share_directory
@@ -75,8 +78,18 @@ class ObjectRecognizer(Node):
             '/sign_board_detection',
             10)
 
+        # Subscription for Server Communication
+        self.subscription_server = self.create_subscription(
+            ServerCommunication,
+            '/ServerCommunication',
+            self.server_communication_callback,
+            10)
+
         self.model = None
         self.received_first_image = False
+        
+        self.mission_received_time = 0.0
+        self.sign_paused_due_to_mission = False
 
         if YOLO is not None:
             try:
@@ -97,6 +110,15 @@ class ObjectRecognizer(Node):
 
         self.get_logger().info("Object Recognizer Node started. Waiting for images...")
 
+    def server_communication_callback(self, message):
+        # Buggy receives commands on dest=1 with ack=0
+        if message.dest == 1 and message.ack == 0:
+            self.mission_received_time = time.time()
+            self.sign_paused_due_to_mission = True
+            self.get_logger().info(
+                f"Mission received: '{message.msg}'. Pausing sign detection for 10 seconds."
+            )
+
     def camera_image_callback(self, message):
         """Processes incoming camera frames to classify traffic signs."""
         if not self.received_first_image:
@@ -109,6 +131,26 @@ class ObjectRecognizer(Node):
 
         if image is None:
             return
+
+        current_time = time.time()
+        if self.sign_paused_due_to_mission:
+            if current_time - self.mission_received_time < 10.0:
+                # ── PAUSED: skip inference, show countdown overlay ──
+                orig_h, orig_w = image.shape[:2]
+                panel_width = 250
+                side_panel = np.ones((orig_h, panel_width, 3), dtype=np.uint8) * 255
+                cv2.putText(side_panel, "Detection Paused", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.putText(side_panel,
+                            f"Resuming in {10.0 - (current_time - self.mission_received_time):.1f}s",
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                combined_img = np.hstack((image, side_panel))
+                cv2.imshow("Sign Board Detection", combined_img)
+                cv2.waitKey(1)
+                return
+            else:
+                self.sign_paused_due_to_mission = False  # resume
+                self.get_logger().info("10 seconds pause complete. Resuming sign detection.")
 
         payload = self.classify_sign(image)
 
@@ -226,11 +268,10 @@ class ObjectRecognizer(Node):
             best_arrow = None
             best_dist = float('inf')
             for arrow in arrows:
-                if abs(letter["cx"] - arrow["cx"]) <= 15 and arrow["cy"] > letter["cy"]:
-                    dist = arrow["cy"] - letter["cy"]
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_arrow = arrow["class"]
+                dist = (letter["cx"] - arrow["cx"])**2 + (letter["cy"] - arrow["cy"])**2
+                if dist < best_dist:
+                    best_dist = dist
+                    best_arrow = arrow["class"]
             
             if best_arrow:
                 pairings[letter["class"]] = best_arrow

@@ -16,9 +16,11 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage, Image
+from std_msgs.msg import String
 import numpy as np
 import cv2
 import math
+import json
 from synapse_msgs.msg import EdgeVectors
 
 QOS_PROFILE_DEFAULT = 10
@@ -31,9 +33,21 @@ GREEN_COLOR = (0, 255, 0)
 # OPTIMIZATION: Set view height percentage for edge vector processing.
 VECTOR_IMAGE_HEIGHT_PERCENTAGE = 0.40
 # OPTIMIZATION: Maximum full image width percentage (100% horizontal FOV).
-VECTOR_IMAGE_WIDTH_PERCENTAGE = 100.0 
+VECTOR_IMAGE_WIDTH_PERCENTAGE = 100.0
 # OPTIMIZATION: Increased minimum magnitude to ignore small black specks/noise.
-VECTOR_MAGNITUDE_MINIMUM = 4.0 
+VECTOR_MAGNITUDE_MINIMUM = 4.0
+
+# --- UPPER-ZONE OBSTACLE DETECTION PARAMETERS ---
+# Minimum contour area (px²) in the upper 60% zone to be counted as an obstacle.
+UPPER_OBS_MIN_AREA = 800
+# Maximum width/height ratio for a valid obstacle contour.
+# Very wide flat blobs (>4:1) are more likely to be the far horizon or lane edge artefacts.
+UPPER_OBS_ASPECT_MAX = 4.0
+# Brightness threshold (0-255): pixels darker than this are flagged as potential obstacles.
+# Road surface and sky are bright; obstacles are typically darker or more saturated.
+UPPER_OBS_BRIGHTNESS_MAX = 160
+# HSV saturation threshold: pixels with S > this are included regardless of brightness.
+UPPER_OBS_SAT_MIN = 60
 
 class EdgeVectorsPublisher(Node):
     """
@@ -62,6 +76,13 @@ class EdgeVectorsPublisher(Node):
         self.publisher_vector_image = self.create_publisher(
             CompressedImage,
             "/debug_images/vector_image",
+            QOS_PROFILE_DEFAULT)
+
+        # Publishes JSON string: {"left": bool, "right": bool}
+        # Consumed by b3rb_ros_line_follower for lane trust gating.
+        self.publisher_obstacle_flags = self.create_publisher(
+            String,
+            '/obstacle_flags',
             QOS_PROFILE_DEFAULT)
 
         self.image_height = 0
@@ -154,6 +175,102 @@ class EdgeVectorsPublisher(Node):
 
         return vectors, image
 
+    # ------------------------------------------------------------------
+    # Upper-zone color-agnostic obstacle detector
+    # ------------------------------------------------------------------
+    def _detect_upper_zone_obstacles(self, image):
+        """
+        Scans the upper zone of the frame (from 10% to 60% of image height) for any
+        physical obstacle, regardless of its color. Two complementary masks are combined:
+
+          1. Dark mask   : pixels darker than the bright road surface
+                           (catches robots, boxes, dark cones, etc.)
+          2. Saturation  : pixels with notable color (orange cones, signs,
+                           coloured vehicles) regardless of brightness
+
+        Contours are then filtered by minimum area and aspect ratio to
+        reject thin far-away lane-edge artefacts.
+
+        Returns
+        -------
+        obs_left  : bool   — obstacle detected on the left half
+        obs_right : bool   — obstacle detected on the right half
+        upper_vis : ndarray — annotated BGR copy of the upper crop
+        """
+        start_y = int(self.image_height * 0.50)
+        end_y = self.upper_image_height
+        upper = image[start_y:end_y].copy()
+        h_up, w_up = upper.shape[:2]
+        half_w = w_up / 2.0
+
+        # --- Build obstacle mask ---
+        gray = cv2.cvtColor(upper, cv2.COLOR_BGR2GRAY)
+        hsv  = cv2.cvtColor(upper, cv2.COLOR_BGR2HSV)
+        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+
+        # 1. Dark-object mask: anything significantly darker than the white road
+        _, dark_mask = cv2.threshold(
+            blurred, UPPER_OBS_BRIGHTNESS_MAX, 255, cv2.THRESH_BINARY_INV)
+
+        # 2. Saturation mask: any noticeably coloured pixel (any hue, any brightness)
+        sat_mask = cv2.threshold(
+            hsv[:, :, 1], UPPER_OBS_SAT_MIN, 255, cv2.THRESH_BINARY)[1]
+
+        # Combine: dark OR coloured = potential obstacle
+        combined = cv2.bitwise_or(dark_mask, sat_mask)
+
+        # Exclude the bottom 20% of the upper zone (transition row near lane crop)
+        # to avoid picking up the top of the near lane markings.
+        transition_row = int(h_up * 0.80)
+        combined[transition_row:] = 0
+
+        # Morphological cleanup: remove salt-and-pepper noise, fill holes
+        k_open  = np.ones((5, 5), np.uint8)
+        k_close = np.ones((9, 9), np.uint8)
+        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN,  k_open)
+        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, k_close)
+
+        contours, _ = cv2.findContours(
+            combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        obs_left  = False
+        obs_right = False
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < UPPER_OBS_MIN_AREA:
+                continue
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            if bh == 0:
+                continue
+            # Reject very flat/wide blobs (far horizon line, lane edge shadow)
+            if (bw / bh) > UPPER_OBS_ASPECT_MAX:
+                continue
+
+            cx = x + bw / 2.0
+            is_left = cx < half_w
+
+            if is_left:
+                obs_left = True
+                label = "OBS LEFT"
+            else:
+                obs_right = True
+                label = "OBS RIGHT"
+
+            cv2.rectangle(upper, (x, y), (x + bw, y + bh), RED_COLOR, 2)
+            cv2.putText(upper, label, (x, max(10, y - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, RED_COLOR, 2)
+
+        # Lane trust status overlay
+        trust_txt = (
+            f"LANE TRUST  L: {'OK' if not obs_left else 'BLOCKED'} "
+            f" R: {'OK' if not obs_right else 'BLOCKED'}"
+        )
+        cv2.putText(upper, trust_txt, (5, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+        return obs_left, obs_right, upper
+
     def process_image_for_edge_vectors(self, image):
         """
         Applies preprocessing (Blur, Grayscale, Thresholding, Morphology) and extracts lane vectors.
@@ -199,21 +316,39 @@ class EdgeVectorsPublisher(Node):
         for side_vectors in [vectors_left, vectors_right]:
             if len(side_vectors) > 0:
                 best_vector = side_vectors[0]
-                
+
                 cv2.line(debug_img, (int(best_vector[0][0]), int(best_vector[0][1])), (int(best_vector[1][0]), int(best_vector[1][1])), GREEN_COLOR, 3)
-                
+
                 # Transform coordinates back to original image space
                 best_vector[0][1] += self.upper_image_height
                 best_vector[1][1] += self.upper_image_height
                 final_vectors.append(best_vector[:2])
+
+        # --- Upper Zone (50% to 60%): color-agnostic obstacle detection ---
+        obs_left, obs_right, upper_vis = self._detect_upper_zone_obstacles(image)
+        self._obs_left  = obs_left
+        self._obs_right = obs_right
 
         self.publish_debug_image(self.publisher_thresh_image, thresh_cropped)
         self.publish_debug_image(self.publisher_vector_image, debug_img)
 
         if getattr(self, 'show_perception_window', False):
             full_debug_img = image.copy()
+            # Upper zone: annotated with obstacle boxes (50% to 60%)
+            start_y = int(self.image_height * 0.50)
+            full_debug_img[start_y:self.upper_image_height] = upper_vis
+            # Lower zone: lane vectors (60% to 100%)
             full_debug_img[self.upper_image_height:] = debug_img
-            cv2.line(full_debug_img, (0, self.upper_image_height), (self.image_width, self.upper_image_height), (0, 255, 255), 3)
+            # Separator line between obstacle zone and lane zone (at 60%)
+            cv2.line(full_debug_img,
+                     (0, self.upper_image_height),
+                     (self.image_width, self.upper_image_height),
+                     (0, 255, 255), 3)
+            # Separator line at top of obstacle zone (at 50%)
+            cv2.line(full_debug_img,
+                     (0, start_y),
+                     (self.image_width, start_y),
+                     (255, 0, 255), 2)
             cv2.imshow("Perception Window - Edge Vectors", full_debug_img)
             cv2.waitKey(1)
 
@@ -256,8 +391,16 @@ class EdgeVectorsPublisher(Node):
             self.get_logger().error(f"Failed to process compressed image: {e}")
 
     def process_and_publish(self, image):
-        """Processes camera image and publishes EdgeVectors."""
+        """Processes camera image, publishes EdgeVectors and obstacle flags."""
         vectors = self.process_image_for_edge_vectors(image)
+
+        # Publish obstacle flags for the line follower to consume
+        flags_msg = String()
+        flags_msg.data = json.dumps({
+            'left':  bool(getattr(self, '_obs_left',  False)),
+            'right': bool(getattr(self, '_obs_right', False)),
+        })
+        self.publisher_obstacle_flags.publish(flags_msg)
 
         vectors_message = EdgeVectors()
         vectors_message.image_height = image.shape[0]

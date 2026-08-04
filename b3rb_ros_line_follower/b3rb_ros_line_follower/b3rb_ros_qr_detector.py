@@ -58,7 +58,7 @@ class QRDetector(Node):
             msg = String()
             msg.data = json.dumps(payload)
             self.publisher_qr.publish(msg)
-            self.get_logger().info(f"Published QR Data: {payload['data']}")
+            self.get_logger().info(f"FOUND QR : {payload['data']}")
 
             # Draw bounding box and text
             bbox = payload['bbox']
