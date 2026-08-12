@@ -21,7 +21,7 @@ import json
 import math
 import numpy as np
 import cv2
-from sensor_msgs.msg import Joy, LaserScan
+from sensor_msgs.msg import Joy, LaserScan, CompressedImage
 from std_msgs.msg import String
 from synapse_msgs.msg import EdgeVectors, ServerCommunication
 import subprocess
@@ -35,10 +35,11 @@ TURN_MAX = 1.0
 QOS_PROFILE_DEFAULT = 10
 
 # --- SPEED & ACCELERATION CONFIGURATION PARAMETERS ---
-TARGET_CRUISE_SPEED = 0.75         # was 0.5 — straight-line speed increase
-MIN_CORNER_SPEED = 0.22            # keep close to original; don't drop below what PD can track
-MAX_ACCEL_LIMIT = 2.5              # was 2.0 — allow reaching new cruise speed without lag
-SPEED_CURVE_SLOWDOWN_GAIN = 0.9    # was 0.5 — steeper falloff so curve speed doesn't rise with cruise speed
+TARGET_CRUISE_SPEED = 1.0          # nominal speed on straight/normal lane tracking
+MIN_CORNER_SPEED = 0.2             # floor speed, never goes slower than this while actively tracking a lane
+MAX_ACCEL_LIMIT = 5.0              # caps how fast speed can ramp up or down per tick (units/sec²)
+MAX_STEER_RATE = 4.0               # caps how fast steering can change per tick
+SPEED_CURVE_SLOWDOWN_GAIN = 0.5    # how much speed is shaved off per unit of steering error
 
 # --- LATTICE PLANNER CONFIGURATION PARAMETERS ---
 LATTICE_LOOKAHEAD_DT = 0.20        # Time step per simulation step (seconds)
@@ -48,18 +49,21 @@ LATTICE_LAT_ACCEL_MAX = 1.4        # Max lateral acceleration limit (m/s^2) for 
 LATTICE_NUM_CANDIDATES = 25        # Number of steering arc trajectories sampled between [-1.0, 1.0]
 LATTICE_MAX_STEER_ANGLE = 0.62     # Maximum physical steering angle (radians)
 LATTICE_COLLISION_RADIUS = 0.15    # Hard collision distance threshold (meters)
-LATTICE_TRACK_X_MAX = 2.0          # Forward distance filter limit for relevant obstacles (meters)
-LATTICE_TRACK_Y_MAX = 0.40         # Lateral width filter limit for track obstacles (meters)
+LATTICE_TRACK_X_MAX = 1.5          # Forward distance filter limit for relevant obstacles (meters)
+LATTICE_TRACK_Y_MAX = 0.15         # Lateral width filter limit for track obstacles (meters)
 
 # --- COST FUNCTION PARAMETERS ("OBSTACLE HUGGING" & TRAJECTORY TUNING) ---
-COST_OBSTACLE_BUFFER_DIST = 0.7    # Distance threshold (m) below which obstacle proximity cost is applied
-COST_OBSTACLE_WEIGHT = 50.0        # Weight multiplier for obstacle proximity penalty
-COST_OBSTACLE_DECAY = 6.0          # Exponential decay factor (higher value = passes closer/hugs obstacle)
-COST_TRACKING_LINEAR_WEIGHT = 10.0 # Weight for linear deviation from ideal line-following steering
-COST_TRACKING_QUAD_WEIGHT = 25.0   # Weight for quadratic deviation from ideal line-following steering
-COST_SMOOTHNESS_WEIGHT = 3.0       # Weight for steering angle change from current steering state
+COST_OBSTACLE_BUFFER_DIST = 0.5    # Distance threshold (m) below which obstacle proximity cost is applied
+COST_OBSTACLE_WEIGHT = 30.0        # Weight multiplier for obstacle proximity penalty
+COST_OBSTACLE_DECAY = 15.0          # Exponential decay factor (higher value = passes closer/hugs obstacle)
+COST_TRACKING_LINEAR_WEIGHT = 150.0 # Weight for linear deviation from ideal line-following steering (was 10.0)
+COST_TRACKING_QUAD_WEIGHT = 400.0  # Weight for quadratic deviation from ideal line-following steering (was 25.0)
+COST_SMOOTHNESS_WEIGHT = 250.0       # Weight for steering angle change from current steering state
 COST_DIRECTIONAL_BIAS_WEIGHT = 8.0 # Penalty weight for steering towards the side of the closest obstacle
 
+# --- REPULSIVE FORCE PARAMETERS ---
+REPULSIVE_FORCE_GAIN = 0.0        # Tuning gain for obstacle repulsion force
+REPULSIVE_LOOKAHEAD_DIST = 0     # Maximum distance to consider obstacles for repulsion
 
 # --- MISSION CONSTANTS ---
 SIGN_MAP = {
@@ -71,6 +75,24 @@ SIGN_MAP = {
 PATIENT_LIFETIME_SEC = 60.0
 ZONE_TIMEOUT_SEC = 30.0
 MAX_COMM_RETRIES = 5
+
+# --- AUTO PARKING BEHAVIOR CONSTANTS ---
+PARKING_TRIGGER_HOSPITAL_COUNT = 3
+PARKING_APPROACH_SPEED = 0.1          # Slow crawl speed inside the bay
+PARKING_TURN_IN_SPEED  = 0.12         # Speed while turning into the bay
+PARKING_CORRIDOR_X_MAX = 1.5
+PARKING_CORRIDOR_Y_MAX = 0.6
+PARKING_STOP_FRONT_DIST = 0.35        # Stop when a wall/end-of-bay is this close ahead
+PARKING_CENTERING_GAIN = 2.5
+PARKING_MAX_STEER = 0.8
+PARKING_TIMEOUT_SEC = 30.0            # Increased timeout for 6s approach + turn + crawl
+PARKING_SIDE_DETECT_DIST = 1.5       # Max lateral LiDAR dist to detect the cone-row opening (m)
+PARKING_SIDE_ANGLE_L = 1.0           # Left side scan window start (rad, ~57°)
+PARKING_SIDE_ANGLE_R = 1.57          # Left side scan window end  (rad, ~90°)
+PARKING_TURN_IN_STEER = 0.85         # Full left Ackermann steer while turning into bay
+PARKING_APPROACH_SECS = 9.0         # Drive straight for 6 seconds to align and find cones
+PARKING_TURN_IN_SECS  = 2.0          # How long to hold the left-turn into the bay
+PARKING_STRAIGHTEN_SECS = 1.5        # After turning, straighten up inside bay
 
 class NodeStatus(Enum):
     SUCCESS = 1
@@ -244,17 +266,217 @@ class ServerDisconnectWatchdog(Behavior):
                 node.mission_state = "ABORT_DISCONNECTED"
         return NodeStatus.SUCCESS
 
+class ParkingBehavior(Behavior):
+    """
+    Multi-phase Ackermann parking maneuver.
+
+    The parking bay is on the LEFT side of the road.  The sequence is:
+
+      Phase 0 – APPROACH_SLOW
+        The buggy is still on the main road.  We use the LEFT-side LiDAR
+        sector (angles ~57°–90° from forward) to detect when a clear gap
+        (no cone closer than PARKING_SIDE_DETECT_DIST) appears, meaning we
+        have reached the mouth of the parking bay.  While searching we crawl
+        slowly forward (vision-based lane centering still running via the
+        EdgeVectors topic that was already published).
+
+      Phase 1 – TURN_IN
+        Apply maximum left Ackermann steering for PARKING_TURN_IN_SECS.
+        The rover describes a tight left arc off the road and into the bay.
+
+      Phase 2 – STRAIGHTEN
+        Release steering to 0 for PARKING_STRAIGHTEN_SECS so that the rover
+        is aligned with the bay corridor.
+
+      Phase 3 – CRAWL_IN
+        Drive straight ahead at PARKING_APPROACH_SPEED.  Use the LEFT/RIGHT
+        LiDAR corridor measurements to stay centred between the cone rows
+        (P-controller). Stop when the front LiDAR detects the end-of-bay wall
+        closer than PARKING_STOP_FRONT_DIST, or on timeout.
+    """
+
+    PHASE_APPROACH_SLOW = 0
+    PHASE_TURN_IN       = 1
+    PHASE_STRAIGHTEN    = 2
+    PHASE_CRAWL_IN      = 3
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.phase      = self.PHASE_APPROACH_SLOW
+        self.phase_start = None
+        self.start_time = None
+
+    def tick(self, node):
+        current_time = node.get_clock().now().nanoseconds / 1e9
+
+        # Global timer starts when tick() is first called
+        if self.start_time is None:
+            self.start_time = current_time
+            self.phase_start = current_time
+            node.get_logger().info("ParkingBehavior: starting — Phase 0 APPROACH_SLOW")
+
+        elapsed_total = current_time - self.start_time
+        elapsed_phase = current_time - (self.phase_start or current_time)
+
+        # --- Global failsafe timeout ---
+        if elapsed_total > PARKING_TIMEOUT_SEC:
+            node.rover_move_manual_mode(0.0, 0.0)
+            node.get_logger().warn("ParkingBehavior: Timeout — stopping as failsafe.")
+            self.reset()
+            return NodeStatus.SUCCESS
+
+        # --- LiDAR preprocessing (shared across phases) ---
+        scan = node.latest_scan
+        obs_x = obs_y = None
+        if scan is not None:
+            angles  = np.arange(scan.angle_min, scan.angle_max, scan.angle_increment)
+            ranges_ = np.array(scan.ranges)
+            n       = min(len(angles), len(ranges_))
+            angles, ranges_ = angles[:n], ranges_[:n]
+            valid   = (ranges_ > scan.range_min) & (ranges_ < 6.0) & ~np.isinf(ranges_)
+            r_v, a_v = ranges_[valid], angles[valid]
+            obs_x = r_v * np.cos(a_v)
+            obs_y = r_v * np.sin(a_v)
+
+        # ────────────────────────────────────────────────────────────────────
+        # Phase 0 — APPROACH_SLOW
+        #   Drive straight for 2 seconds (PARKING_APPROACH_SECS) to find/align with cones properly.
+        # ────────────────────────────────────────────────────────────────────
+        if self.phase == self.PHASE_APPROACH_SLOW:
+            if elapsed_phase < PARKING_APPROACH_SECS:
+                node.rover_move_manual_mode(PARKING_TURN_IN_SPEED, 0.0)
+                node.get_logger().info(
+                    f"ParkingBehavior Ph0 APPROACH_SLOW: driving straight to position t={elapsed_phase:.1f}s/{PARKING_APPROACH_SECS:.1f}s",
+                    throttle_duration_sec=0.5)
+            else:
+                self.phase = self.PHASE_TURN_IN
+                self.phase_start = current_time
+                node.get_logger().info("ParkingBehavior: Phase 0 complete — starting Phase 1 TURN_IN")
+            return NodeStatus.RUNNING
+
+        # ────────────────────────────────────────────────────────────────────
+        # Phase 1 — TURN_IN
+        #   Apply full left Ackermann steering to swing into the bay.
+        # ────────────────────────────────────────────────────────────────────
+        elif self.phase == self.PHASE_TURN_IN:
+            if elapsed_phase < PARKING_TURN_IN_SECS:
+                node.rover_move_manual_mode(PARKING_TURN_IN_SPEED, PARKING_TURN_IN_STEER)
+                node.get_logger().info(
+                    f"ParkingBehavior Ph1 TURN_IN: steer={PARKING_TURN_IN_STEER:.2f} t={elapsed_phase:.1f}s",
+                    throttle_duration_sec=0.5)
+            else:
+                self.phase = self.PHASE_STRAIGHTEN
+                self.phase_start = current_time
+                node.get_logger().info("ParkingBehavior: Phase 2 STRAIGHTEN")
+            return NodeStatus.RUNNING
+
+        # ────────────────────────────────────────────────────────────────────
+        # Phase 2 — STRAIGHTEN
+        #   Release steering so the rover lines up with the bay axis.
+        # ────────────────────────────────────────────────────────────────────
+        elif self.phase == self.PHASE_STRAIGHTEN:
+            if elapsed_phase < PARKING_STRAIGHTEN_SECS:
+                node.rover_move_manual_mode(PARKING_APPROACH_SPEED, 0.0)
+                node.get_logger().info(
+                    f"ParkingBehavior Ph2 STRAIGHTEN: t={elapsed_phase:.1f}s",
+                    throttle_duration_sec=0.5)
+            else:
+                self.phase = self.PHASE_CRAWL_IN
+                self.phase_start = current_time
+                node.get_logger().info("ParkingBehavior: Phase 3 CRAWL_IN")
+            return NodeStatus.RUNNING
+
+        # ────────────────────────────────────────────────────────────────────
+        # Phase 3 — CRAWL_IN
+        #   Slowly drive straight ahead into the bay, centred between cones.
+        #   Stop when the end-of-bay wall is close ahead.
+        # ────────────────────────────────────────────────────────────────────
+        elif self.phase == self.PHASE_CRAWL_IN:
+            # End-of-bay detection: obstacle dead ahead
+            if obs_x is not None:
+                front_mask = (
+                    (obs_x > 0.05) &
+                    (obs_x < PARKING_STOP_FRONT_DIST) &
+                    (np.abs(obs_y) < 0.35)
+                )
+                if np.any(front_mask):
+                    node.rover_move_manual_mode(0.0, 0.0)
+                    node.get_logger().info("ParkingBehavior: Front obstacle — PARKED!")
+                    self.reset()
+                    return NodeStatus.SUCCESS
+
+            # Corridor centering using LiDAR
+            steer = 0.0
+            if obs_x is not None:
+                corridor_mask = (
+                    (obs_x > 0.1) &
+                    (obs_x < PARKING_CORRIDOR_X_MAX) &
+                    (np.abs(obs_y) < PARKING_CORRIDOR_Y_MAX)
+                )
+                cy = obs_y[corridor_mask]
+                if len(cy) > 0:
+                    left_pts  = cy[cy > 0]
+                    right_pts = cy[cy < 0]
+                    left_dist  = np.min(left_pts)          if len(left_pts)  > 0 else PARKING_CORRIDOR_Y_MAX
+                    right_dist = np.min(np.abs(right_pts)) if len(right_pts) > 0 else PARKING_CORRIDOR_Y_MAX
+                    lateral_error = right_dist - left_dist
+                    steer = max(-PARKING_MAX_STEER,
+                                min(PARKING_MAX_STEER, lateral_error * PARKING_CENTERING_GAIN))
+
+            # Optionally override with vision-vector steering if cones are visible
+            vectors = node.vectors
+            if vectors is not None and vectors.vector_count > 0:
+                half_width = vectors.image_width / 2.0
+                raw_turn = 0.0
+                if vectors.vector_count == 2:
+                    mid_x_bottom = (vectors.vector_1[0].x + vectors.vector_2[0].x) / 2.0
+                    mid_x_top    = (vectors.vector_1[1].x + vectors.vector_2[1].x) / 2.0
+                    dx_mid = mid_x_top - mid_x_bottom
+                    dy_mid = ((vectors.vector_1[1].y + vectors.vector_2[1].y) / 2.0 -
+                              (vectors.vector_1[0].y + vectors.vector_2[0].y) / 2.0)
+                    if dy_mid != 0:
+                        raw_turn = math.atan2(dx_mid, -dy_mid)
+                elif vectors.vector_count == 1:
+                    dx = vectors.vector_1[1].x - vectors.vector_1[0].x
+                    dy = vectors.vector_1[1].y - vectors.vector_1[0].y
+                    if dy != 0:
+                        angle      = math.atan2(dx, -dy)
+                        offset_x   = vectors.vector_1[0].x - half_width
+                        raw_turn   = angle + (offset_x / half_width) * 0.5
+                vision_steer = max(-PARKING_MAX_STEER, min(PARKING_MAX_STEER, raw_turn * 2.0))
+                # Blend: 60% vision, 40% LiDAR centering
+                steer = 0.6 * vision_steer + 0.4 * steer
+
+            node.get_logger().info(
+                f"ParkingBehavior Ph3 CRAWL_IN: steer={steer:.2f} t={elapsed_phase:.1f}s",
+                throttle_duration_sec=0.5)
+            node.rover_move_manual_mode(PARKING_APPROACH_SPEED, steer)
+            return NodeStatus.RUNNING
+
+        # Fallback
+        node.rover_move_manual_mode(0.0, 0.0)
+        return NodeStatus.RUNNING
+
 class MissionController(Behavior):
     def __init__(self):
         self.patient_cycle = PatientCycleBehavior()
+        self.parking_behavior = ParkingBehavior()
         
     def tick(self, node):
         if node.mission_state == "ENTER_CITY":
-            node.mission_state = "AWAITING_INITIAL_ASSIGNMENT"
-            node.get_logger().info("Mission Start: Waiting for initial target from server (send_target.py)")
+            initial_patient = node.received_target if node.received_target else 'A'
+            node.received_target = None
+            node.current_patient_target = SIGN_MAP.get(initial_patient, initial_patient)
+            node.current_target = node.current_patient_target
+            node.patient_spawn_time = node.get_clock().now().nanoseconds / 1e9
+            node.mission_state = "SEEKING_PATIENT"
+            node.get_logger().info(f"Mission Start: Default target '{initial_patient}' ({node.current_patient_target}). Navigating immediately.")
+            return NodeStatus.RUNNING
             
         elif node.mission_state == "AWAITING_INITIAL_ASSIGNMENT":
-            # Stay stopped; poll received_target set by server_communication_callback
+            # Fallback if state is manually set
             node.rover_move_manual_mode(0.0, 0.0)
             if node.received_target:
                 initial_patient = node.received_target
@@ -277,10 +499,29 @@ class MissionController(Behavior):
             node.mission_state = "SEEKING_PARK"
             
         elif node.mission_state == "SEEKING_PARK":
+            # Take full motor control — stop letting NavigationAction drive straight.
+            # Slow down and look for the bay entrance with LiDAR; then
+            # hand off to ParkingBehavior once the gap is aligned.
             if node.in_zone == "PARKING":
+                # QR zone triggered — enter bay immediately
+                node.mission_state = "PARKING_MANEUVER"
+                node.get_logger().info("Parking zone QR reached. Handing off to ParkingBehavior.")
+                return NodeStatus.RUNNING
+            # While still seeking: ParkingBehavior Phase 0 handles the slow approach
+            # so we can reuse its gap-detection logic. Drive slowly forward.
+            status = self.parking_behavior.tick(node)
+            if status == NodeStatus.SUCCESS:
+                # Gap found and we entered — but wait for QR or just begin maneuver
+                node.mission_state = "PARKING_MANEUVER"
+                node.get_logger().info("Gap found by ParkingBehavior. Starting maneuver.")
+            return NodeStatus.RUNNING
+
+        elif node.mission_state == "PARKING_MANEUVER":
+            status = self.parking_behavior.tick(node)
+            if status == NodeStatus.SUCCESS:
                 node.mission_state = "PARKED"
-                node.rover_move_manual_mode(0.0, 0.0)
-                node.get_logger().info("Parked! Mission complete.")
+                node.get_logger().info("Parking maneuver complete. Mission finished.")
+            return NodeStatus.RUNNING
                 
         elif node.mission_state == "PARKED":
             node.rover_move_manual_mode(0.0, 0.0)
@@ -311,13 +552,13 @@ class PatientCycleBehavior(Behavior):
                     current_time = node.get_clock().now().nanoseconds / 1e9
                     if not hasattr(node, 'zone_stop_start_time') or node.zone_stop_start_time is None:
                         node.zone_stop_start_time = current_time
-                        node.get_logger().info(f"Target QR detected ({node.last_qr_read_data})! Driving for 5 seconds before stopping beside board...")
-                    elif current_time - node.zone_stop_start_time >= 5.0:
+                        node.get_logger().info(f"Target QR detected ({node.last_qr_read_data})! Driving for 10 seconds before stopping beside board...")
+                    elif current_time - node.zone_stop_start_time >= 10.0:
                         node.mission_state = "IN_PATIENT_ZONE"
                         node.zone_stop_start_time = None
                         node.send_server_msg(node.last_qr_read_data, is_ack=False)
                         node.get_logger().info(
-                            f"\033[1;32m[SERVER PUBLISH] Arrived at {node.current_patient_target} (QR={node.last_qr_read_data}) after 5s drive delay. Sent 1 report to server. Waiting for hospital assignment...\033[0m"
+                            f"\033[1;32m[SERVER PUBLISH] Arrived at {node.current_patient_target} (QR={node.last_qr_read_data}) after 10s drive delay. Sent 1 report to server. Waiting for hospital assignment...\033[0m"
                         )
                 else:
                     node.get_logger().info(
@@ -355,9 +596,10 @@ class PatientCycleBehavior(Behavior):
                         node.mission_state = "IN_HOSPITAL_ZONE"
                         node.patients_done += 1
                         node.zone_stop_start_time = None
+                        node.received_ack = False
                         node.send_server_msg(node.last_qr_read_data, is_ack=False)
                         node.get_logger().info(
-                            f"\033[1;32m[SERVER PUBLISH] Arrived at {node.current_hospital_target} (QR={node.last_qr_read_data}) after 7s drive delay. Sent 1 report to server. Patients done: {node.patients_done}. Waiting for next assignment...\033[0m"
+                            f"\033[1;32m[SERVER PUBLISH] Arrived at {node.current_hospital_target} (QR={node.last_qr_read_data}) after 7s drive delay. Sent 1 report to server. Patients done: {node.patients_done}. Waiting for server ACK...\033[0m"
                         )
                 else:
                     node.get_logger().info(
@@ -366,15 +608,38 @@ class PatientCycleBehavior(Behavior):
                     )
 
         elif node.mission_state == "IN_HOSPITAL_ZONE":
-            # Stay stopped. Server sends next patient letter (A/B/C) or 'DONE' / 'PARKING'
             node.rover_move_manual_mode(0.0, 0.0)
+            
+            # If 3rd hospital delivery completed, stay stopped and wait specifically for 'PARKING' command from server
+            if node.patients_done >= PARKING_TRIGGER_HOSPITAL_COUNT:
+                has_parking_target = node.received_target and node.received_target in ("DONE", "PARKING")
+                
+                if has_parking_target:
+                    node.received_ack = False
+                    node.received_target = None
+                    node.hospital_resume_straight = False
+                    node.mission_state = "EXITING"
+                    node.get_logger().info(
+                        f"{node.patients_done} hospitals completed and explicit 'PARKING' server message received. Heading to parking."
+                    )
+                    return NodeStatus.SUCCESS
+                else:
+                    node.get_logger().info(
+                        f"At hospital {node.patients_done}/{PARKING_TRIGGER_HOSPITAL_COUNT}. Waiting for 'PARKING' command from server...",
+                        throttle_duration_sec=2.0
+                    )
+                    return NodeStatus.RUNNING
+                
             if node.received_target:
                 raw = node.received_target
                 node.received_target = None
+                node.hospital_resume_time = node.get_clock().now().nanoseconds / 1e9
+                node.hospital_resume_straight = True
 
                 if raw in ("DONE", "PARKING"):
+                    node.hospital_resume_straight = False
                     node.mission_state = "EXITING"
-                    node.get_logger().info(f"Server sent '{raw}'. All patients served. Heading to park.")
+                    node.get_logger().info(f"Server sent '{raw}'. Immediately heading to park.")
                 else:
                     next_patient = SIGN_MAP.get(raw, raw)
                     node.current_patient_target = next_patient
@@ -397,148 +662,232 @@ class ZoneGuard(Behavior):
             return NodeStatus.SUCCESS
         return NodeStatus.FAILURE
 
-class OvertakeBehavior(Behavior):
+class LargeObstacleAvoidanceBehavior(Behavior):
     def tick(self, node):
         if not hasattr(node, 'overtake_state'):
             node.overtake_state = 'IDLE'
-            node.overtake_start_time = 0.0
-            node.overtake_direction = 1.0
+            node.overtake_wp_x = 0.0
+            node.overtake_wp_y = 0.0
+            node.overtake_robot_x = 0.0
+            node.overtake_robot_y = 0.0
+            node.overtake_robot_yaw = 0.0
 
-        if node.overtake_state != 'IDLE':
-            return self._execute_overtake(node)
+        if node.overtake_state == 'IDLE':
+            if not hasattr(node, 'latest_scan') or node.latest_scan is None:
+                return NodeStatus.FAILURE
 
-        if not hasattr(node, 'latest_scan') or node.latest_scan is None:
+            scan = node.latest_scan
+            angles = np.arange(scan.angle_min, scan.angle_max, scan.angle_increment)
+            ranges = np.array(scan.ranges)
+            min_len = min(len(angles), len(ranges))
+            angles = angles[:min_len]
+            ranges = ranges[:min_len]
+
+            valid_idx = (ranges > scan.range_min) & (ranges < 4.0) & ~np.isinf(ranges)
+            valid_ranges = ranges[valid_idx]
+            valid_angles = angles[valid_idx]
+
+            obs_x = valid_ranges * np.cos(valid_angles)
+            obs_y = valid_ranges * np.sin(valid_angles)
+
+            # Detect obstacle directly in front (up to 0.65m)
+            front_mask = (obs_x > 0.1) & (obs_x < 0.65) & (np.abs(obs_y) <= 0.4)
+            if np.any(front_mask):
+                obs_width = np.max(obs_y[front_mask]) - np.min(obs_y[front_mask])
+                if obs_width > 0.4: # > 50% lane width (assuming 0.8m lane)
+                    node.overtake_state = 'OVERTAKING'
+                    mean_y = np.mean(obs_y[front_mask])
+                    max_x = np.max(obs_x[front_mask])
+                    
+                    # Reset local odometry
+                    node.overtake_robot_x = 0.0
+                    node.overtake_robot_y = 0.0
+                    node.overtake_robot_yaw = 0.0
+                    
+                    # Waypoint is 1.0m past the obstacle
+                    node.overtake_wp_x = max_x + 1.0
+                    
+                    # Offset waypoint significantly to avoid clipping the obstacle
+                    if mean_y < 0:
+                        node.overtake_wp_y = 0.8
+                    else:
+                        node.overtake_wp_y = -0.8
+                        
+                    node.last_overtake_time = node.get_clock().now().nanoseconds / 1e9
+                    node.get_logger().info(f"Large Obstacle! Width={obs_width:.2f}. Waypoint set to ({node.overtake_wp_x:.2f}, {node.overtake_wp_y:.2f})")
+                    return self._execute_overtake(node)
             return NodeStatus.FAILURE
-
-        scan = node.latest_scan
-        angles = np.arange(scan.angle_min, scan.angle_max, scan.angle_increment)
-        ranges = np.array(scan.ranges)
-        min_len = min(len(angles), len(ranges))
-        angles = angles[:min_len]
-        ranges = ranges[:min_len]
-
-        valid_idx = (ranges > scan.range_min) & (ranges < 4.0) & ~np.isinf(ranges)
-        valid_ranges = ranges[valid_idx]
-        valid_angles = angles[valid_idx]
-
-        obs_x = valid_ranges * np.cos(valid_angles)
-        obs_y = valid_ranges * np.sin(valid_angles)
-
-        # Detect obstacle directly in front (x < 1.0m, y < 0.4m)
-        front_mask = (obs_x > 0.1) & (obs_x < 1.0) & (np.abs(obs_y) <= 0.4)
-        if np.any(front_mask):
-            obs_width = np.max(obs_y[front_mask]) - np.min(obs_y[front_mask])
-            if obs_width > 0.25: # Slightly reduced threshold for faster reaction
-                node.overtake_state = 'SWERVE_OUT'
-                node.overtake_start_time = node.get_clock().now().nanoseconds / 1e9
-                mean_y = np.mean(obs_y[front_mask])
-                
-                # If obstacle is on the right (mean_y < 0), swerve left (dir = 1.0)
-                node.overtake_direction = 1.0 if mean_y < 0 else -1.0
-                node.get_logger().info(f"Overtake: Obstacle detected! SWERVE_OUT dir={node.overtake_direction}")
-                return self._execute_overtake(node)
-
-        return NodeStatus.FAILURE
+            
+        else:
+            return self._execute_overtake(node)
 
     def _execute_overtake(self, node):
         current_time = node.get_clock().now().nanoseconds / 1e9
-        elapsed = current_time - node.overtake_start_time
+        if not hasattr(node, 'last_overtake_time'):
+            node.last_overtake_time = current_time
+            
+        dt = current_time - node.last_overtake_time
+        node.last_overtake_time = current_time
         
         speed = 0.4
-        steer_mag = 0.8
-
-        if node.overtake_state == 'SWERVE_OUT':
-            # Phase 1: Swerve out of the lane
-            if elapsed < 0.8: # Shortened slightly to prevent going entirely off-track
-                node.rover_move_manual_mode(speed, node.overtake_direction * steer_mag)
-                return NodeStatus.RUNNING
-            else:
-                node.overtake_state = 'STRAIGHT'
-                node.overtake_start_time = current_time
-                node.get_logger().info("Overtake: STRAIGHT (Checking side clearance...)")
-                return NodeStatus.RUNNING
-
-        elif node.overtake_state == 'STRAIGHT':
-            # Phase 2: Drive parallel and scan the side
-            node.rover_move_manual_mode(speed, 0.0)
-            
-            scan = node.latest_scan
-            ranges = np.array(scan.ranges)
-            angles = np.arange(scan.angle_min, scan.angle_max, scan.angle_increment)[:len(ranges)]
-            
-            # Define "Side Vision" cone. 
-            # If we swerved Left (direction 1.0), look Right (negative angles -1.5 to -0.3 rad)
-            if node.overtake_direction == 1.0:
-                side_mask = (angles > -1.5) & (angles < -0.3)
-            else:
-                side_mask = (angles > 0.3) & (angles < 1.5)
-                
-            side_ranges = ranges[side_mask]
-            
-            # Check if there are any points dangerously close (under 0.8 meters) on our side
-            side_clear = True
-            if len(side_ranges) > 0:
-                min_side_dist = np.min(side_ranges)
-                if min_side_dist < 0.8:
-                    side_clear = False
-
-            # We must drive straight for at least 0.5s to clear our own back wheels, 
-            # AND the side must be clear of the obstacle.
-            if side_clear and elapsed > 0.5:
-                node.overtake_state = 'SWERVE_IN'
-                node.overtake_start_time = current_time
-                node.get_logger().info("Overtake: Obstacle cleared! SWERVE_IN")
-                
-            # Failsafe: If we are stuck driving straight for 3 seconds, force return to lane
-            if elapsed > 3.0:
-                node.overtake_state = 'SWERVE_IN'
-                node.overtake_start_time = current_time
-                node.get_logger().warn("Overtake: Clearance timeout. Forcing SWERVE_IN")
-
-            return NodeStatus.RUNNING
+        L = 0.3 # wheelbase
         
-        elif node.overtake_state == 'SWERVE_IN':
-            # Phase 3: Return to lane
-            if elapsed < 0.8:
-                node.rover_move_manual_mode(speed, -node.overtake_direction * steer_mag)
-                return NodeStatus.RUNNING
-            else:
-                node.overtake_state = 'IDLE'
-                node.get_logger().info("Overtake: DONE")
-                return NodeStatus.SUCCESS
-
+        # Current steering angle in radians (approx based on target_turn)
+        steer_rad = getattr(node, 'target_turn', 0.0) * 0.62
+        
+        # Update robot pose (Kinematic bicycle model)
+        node.overtake_robot_x += speed * math.cos(node.overtake_robot_yaw) * dt
+        node.overtake_robot_y += speed * math.sin(node.overtake_robot_yaw) * dt
+        node.overtake_robot_yaw += (speed / L) * math.tan(steer_rad) * dt
+        
+        # Calculate waypoint in robot's local frame
+        dx = node.overtake_wp_x - node.overtake_robot_x
+        dy = node.overtake_wp_y - node.overtake_robot_y
+        
+        local_wp_x = dx * math.cos(-node.overtake_robot_yaw) - dy * math.sin(-node.overtake_robot_yaw)
+        local_wp_y = dx * math.sin(-node.overtake_robot_yaw) + dy * math.cos(-node.overtake_robot_yaw)
+        
+        if local_wp_x < 0.2:
+            node.overtake_state = 'IDLE'
+            node.get_logger().info("Overtake: Waypoint reached. Returning to lane.")
+            return NodeStatus.SUCCESS
+            
+        # Pure pursuit steering to the local waypoint
+        L_d_sq = local_wp_x**2 + local_wp_y**2
+        if L_d_sq < 0.01:
+            steer_mag = 0.0
+        else:
+            curvature = 2.0 * local_wp_y / L_d_sq
+            target_steer_rad = math.atan(L * curvature)
+            steer_mag = max(-1.0, min(1.0, target_steer_rad / 0.62))
+        
+        node.rover_move_manual_mode(speed, steer_mag)
         return NodeStatus.RUNNING
 
 class NavigationAction(Behavior):
     def tick(self, node):
-        if node.vectors is None:
+        current_time = node.get_clock().now().nanoseconds / 1e9
+        resume_time = getattr(node, 'hospital_resume_time', 0.0)
+        vectors = node.vectors
+        if getattr(node, 'hospital_resume_straight', False):
+            if resume_time > 0.0 and (current_time - resume_time) < 4.0:
+                if vectors is None or vectors.vector_count == 0:
+                    # Construct virtual straight vectors so that the Lattice Planner and obstacle avoidance stay active
+                    from synapse_msgs.msg import EdgeVectors
+                    virtual_vectors = EdgeVectors()
+                    virtual_vectors.image_width = 640
+                    virtual_vectors.image_height = 480
+                    virtual_vectors.vector_count = 2
+                    
+                    # Left vector
+                    virtual_vectors.vector_1[0].x = 160.0
+                    virtual_vectors.vector_1[0].y = 0.0
+                    virtual_vectors.vector_1[1].x = 160.0
+                    virtual_vectors.vector_1[1].y = 480.0
+                    
+                    # Right vector
+                    virtual_vectors.vector_2[0].x = 480.0
+                    virtual_vectors.vector_2[0].y = 0.0
+                    virtual_vectors.vector_2[1].x = 480.0
+                    virtual_vectors.vector_2[1].y = 480.0
+                    
+                    vectors = virtual_vectors
+                    node.get_logger().info("Hospital resume: using virtual straight vectors", throttle_duration_sec=0.5)
+            else:
+                node.hospital_resume_straight = False
+                node.hospital_lane_memory_active = False
+
+        if vectors is None:
             node.rover_move_manual_mode(0.0, 0.0)
             return NodeStatus.RUNNING
-            
-        vectors = node.vectors
+
+        # Filter vectors if near obstacle/cones to avoid trusting short contours (e.g. from cones)
+        near_obstacle = False
+        if getattr(node, 'cone_detected', False):
+            near_obstacle = True
+        elif hasattr(node, 'latest_scan') and node.latest_scan is not None:
+            scan = node.latest_scan
+            angles = np.arange(scan.angle_min, scan.angle_max, scan.angle_increment)
+            ranges = np.array(scan.ranges)
+            min_len = min(len(angles), len(ranges))
+            angles = angles[:min_len]
+            ranges = ranges[:min_len]
+            valid_idx = (ranges > scan.range_min) & (ranges < 4.0) & ~np.isinf(ranges)
+            if np.any(valid_idx):
+                obs_x = ranges[valid_idx] * np.cos(angles[valid_idx])
+                obs_y = ranges[valid_idx] * np.sin(angles[valid_idx])
+                front_mask = (obs_x > 0.1) & (obs_x < 1.2) & (np.abs(obs_y) <= 0.4)
+                if np.any(front_mask):
+                    near_obstacle = True
+
+        if near_obstacle:
+            def is_proper_vector(pt_start, pt_end):
+                dx = pt_end.x - pt_start.x
+                dy = pt_end.y - pt_start.y
+                mag = math.hypot(dx, dy)
+                return mag > 80.0 and abs(dy) > 60.0
+
+            valid_count = 0
+            if vectors.vector_count == 2:
+                v1_valid = is_proper_vector(vectors.vector_1[0], vectors.vector_1[1])
+                v2_valid = is_proper_vector(vectors.vector_2[0], vectors.vector_2[1])
+                if v1_valid and v2_valid:
+                    valid_count = 2
+                elif v1_valid:
+                    valid_count = 1
+                elif v2_valid:
+                    valid_count = 1
+                    from copy import copy
+                    vectors = copy(vectors)
+                    vectors.vector_1 = vectors.vector_2
+                else:
+                    valid_count = 0
+            elif vectors.vector_count == 1:
+                if is_proper_vector(vectors.vector_1[0], vectors.vector_1[1]):
+                    valid_count = 1
+                else:
+                    valid_count = 0
+
+            if valid_count < vectors.vector_count:
+                from copy import copy
+                vectors = copy(vectors)
+                vectors.vector_count = valid_count
+                node.get_logger().info(f"Near obstacle/cone: ignoring short contours, treating vector_count as {valid_count}", throttle_duration_sec=1.0)
+
         half_width = vectors.image_width / 2.0
         speed = 0.5  # Normal speed
         raw_turn = 0.0
 
         if getattr(node, 'hospital_lane_memory_active', False):
-            if vectors.vector_count == 2:
-                dx1 = vectors.vector_1[1].x - vectors.vector_1[0].x
-                dy1 = vectors.vector_1[1].y - vectors.vector_1[0].y
-                mag1 = math.hypot(dx1, dy1)
-                
-                dx2 = vectors.vector_2[1].x - vectors.vector_2[0].x
-                dy2 = vectors.vector_2[1].y - vectors.vector_2[0].y
-                mag2 = math.hypot(dx2, dy2)
-                
-                crop_height = vectors.image_height * 0.40
-                confidence1 = (mag1 / crop_height) * 100.0 if crop_height > 0 else 0
-                confidence2 = (mag2 / crop_height) * 100.0 if crop_height > 0 else 0
-                
-                if confidence1 > 70.0 and confidence2 > 70.0:
-                    node.hospital_lane_memory_active = False
-                    node.get_logger().info(f"Both lanes > 40% confidence (L:{confidence1:.1f}%, R:{confidence2:.1f}%). Exiting memory mode.")
+            current_time = node.get_clock().now().nanoseconds / 1e9
+            resume_time = getattr(node, 'hospital_resume_time', 0.0)
+            # Irrespective of confidence, use memory mode for the first 3 seconds after resuming
+            if resume_time > 0.0 and (current_time - resume_time) >= 3.0:
+                if vectors.vector_count == 2:
+                    dx1 = vectors.vector_1[1].x - vectors.vector_1[0].x
+                    dy1 = vectors.vector_1[1].y - vectors.vector_1[0].y
+                    mag1 = math.hypot(dx1, dy1)
+                    
+                    dx2 = vectors.vector_2[1].x - vectors.vector_2[0].x
+                    dy2 = vectors.vector_2[1].y - vectors.vector_2[0].y
+                    mag2 = math.hypot(dx2, dy2)
+                    
+                    crop_height = vectors.image_height * 0.40
+                    confidence1 = (mag1 / crop_height) * 100.0 if crop_height > 0 else 0
+                    confidence2 = (mag2 / crop_height) * 100.0 if crop_height > 0 else 0
+                    
+                    if confidence1 > 70.0 and confidence2 > 70.0:
+                        node.hospital_lane_memory_active = False
+                        node.get_logger().info(f"Both lanes > 70% confidence (L:{confidence1:.1f}%, R:{confidence2:.1f}%). Exiting memory mode.")
 
         in_hospital_memory = getattr(node, 'hospital_lane_memory_active', False)
+
+        if vectors.vector_count > 0:
+            import copy
+            node.last_valid_vectors = copy.deepcopy(vectors)
+        elif in_hospital_memory and hasattr(node, 'last_valid_vectors'):
+            vectors = node.last_valid_vectors
+            node.get_logger().info("Using last stored vector in hospital zone", throttle_duration_sec=1.0)
 
         if vectors.vector_count > 0:
             if getattr(node, 'in_intersection', False):
@@ -548,50 +897,94 @@ class NavigationAction(Behavior):
                     node.sign_detected = False
                     node.last_detected_sign = None
                     node.last_turn_clear_time = node.get_clock().now().nanoseconds / 1e9
-                    node.get_logger().info("Intersection cleared. Resetting sign detection and initiating 6s cooldown.")
+                    node.get_logger().info("Intersection cleared. Resetting sign detection and initiating 3s cooldown.")
 
-        if in_hospital_memory:
-            # In hospital zone (fake or real), use previous lane data when lanes are obstructed
-            # until both side lanes are detected again with > 80 magnitude.
-            error = node.last_error
-            derivative = 0.0
-            raw_turn = (error * 1.5)
-            speed = 0.4
-        elif vectors.vector_count == 0:
+        if vectors.vector_count == 0:
             node.in_intersection = True
             node.intersection_exit_ticks = 0
             speed = 0.2
-            target = getattr(node, 'current_target', None) or getattr(node, 'target_patient', None)
-            desired_dir = None
-            target_key = SIGN_MAP.get(target, target)
-            node.get_logger().info(f"DEBUG Intersection: target={target} (key={target_key}), sign_config_map={getattr(node, 'sign_config_map', {})}")
-            if target_key and hasattr(node, 'sign_config_map') and target_key in node.sign_config_map:
-                desired_dir = node.sign_config_map[target_key]
-                node.get_logger().info(f"Intersection: Target '{target}' mapped to direction '{desired_dir}'")
-            elif hasattr(node, 'last_detected_sign') and node.last_detected_sign is not None:
-                desired_dir = node.last_detected_sign
-                node.get_logger().info(f"Intersection: Fallback to last_detected_sign '{desired_dir}'")
 
-            if desired_dir in ["left", "Left"]:
-                raw_turn = 0.6
-            elif desired_dir in ["right", "Right"]:
-                raw_turn = -0.6
-            elif desired_dir in ["straight", "Straight", "up", "Up"]:
-                raw_turn = 0.0
-            else:
-                if node.last_error > 0.2:
-                    raw_turn = 0.6  # line is to the left, steer left to find it
-                elif node.last_error < -0.2:
-                    raw_turn = -0.6 # line is to the right, steer right to find it
+            # --- OBSTACLE AVOIDANCE WHEN NO LANE IS DETECTED ---
+            # Check if LiDAR sees an obstacle in the forward zone.
+            # If yes: treat lane as straight and use LiDAR repulsion to steer away.
+            lidar_obstacle_avoidance_active = False
+            if node.latest_scan is not None:
+                _scan = node.latest_scan
+                _angles = np.arange(_scan.angle_min, _scan.angle_max, _scan.angle_increment)
+                _ranges = np.array(_scan.ranges)
+                _min_len = min(len(_angles), len(_ranges))
+                _angles = _angles[:_min_len]
+                _ranges = _ranges[:_min_len]
+
+                # Only look at a narrow forward cone (±40°) for real obstacles
+                _fwd_mask = (_angles > -0.70) & (_angles < 0.70)
+                _fwd_ranges = _ranges[_fwd_mask]
+                _fwd_angles = _angles[_fwd_mask]
+
+                # Clean: ignore invalid readings
+                _valid = (_fwd_ranges > _scan.range_min) & (_fwd_ranges < 4.0) & ~np.isinf(_fwd_ranges)
+                _fwd_ranges = _fwd_ranges[_valid]
+                _fwd_angles = _fwd_angles[_valid]
+
+                if len(_fwd_ranges) > 0:
+                    _min_fwd_dist = float(np.min(_fwd_ranges))
+                    # Obstacle within 1.2 m triggers avoidance
+                    if _min_fwd_dist < 1.2:
+                        lidar_obstacle_avoidance_active = True
+                        # Compute a summed repulsive steer from all close front points
+                        _obs_x = _fwd_ranges * np.cos(_fwd_angles)
+                        _obs_y = _fwd_ranges * np.sin(_fwd_angles)
+                        _avoid_steer = 0.0
+                        for ox, oy in zip(_obs_x, _obs_y):
+                            _dist = max(0.1, math.sqrt(ox**2 + oy**2))
+                            _force = 0.15 / (_dist ** 2)
+                            if oy > 0:
+                                _avoid_steer -= _force  # obstacle left → steer right
+                            else:
+                                _avoid_steer += _force  # obstacle right → steer left
+                        _avoid_steer = max(-1.0, min(1.0, _avoid_steer))
+                        raw_turn = _avoid_steer
+                        speed = 0.25
+                        node.get_logger().info(
+                            f"No lane + obstacle at {_min_fwd_dist:.2f}m: LiDAR avoidance steer={_avoid_steer:.2f}",
+                            throttle_duration_sec=0.5)
+
+            if not lidar_obstacle_avoidance_active:
+                target = getattr(node, 'current_target', None) or getattr(node, 'target_patient', None)
+                desired_dir = None
+                target_key = SIGN_MAP.get(target, target)
+                node.get_logger().info(f"DEBUG Intersection: target={target} (key={target_key}), sign_config_map={getattr(node, 'sign_config_map', {})}")
+                if target_key and hasattr(node, 'sign_config_map') and target_key in node.sign_config_map:
+                    desired_dir = node.sign_config_map[target_key]
+                    node.get_logger().info(f"Intersection: Target '{target}' mapped to direction '{desired_dir}'")
+                elif hasattr(node, 'last_detected_sign') and node.last_detected_sign is not None:
+                    desired_dir = node.last_detected_sign
+                    node.get_logger().info(f"Intersection: Fallback to last_detected_sign '{desired_dir}'")
+
+                if desired_dir in ["left", "Left"]:
+                    raw_turn = 0.6
+                elif desired_dir in ["right", "Right"]:
+                    raw_turn = -0.6
+                elif desired_dir in ["straight", "Straight", "up", "Up"]:
+                    if getattr(node, 'in_zone', None) is None and not getattr(node, 'hospital_lane_memory_active', False):
+                        # Steer 3 degrees counter-clockwise (left) (~0.08 normalized turn) to find the path at a cross section
+                        raw_turn = 0.08
+                        node.get_logger().info("Intersection (Straight): Steering 3 degrees left to find lane", throttle_duration_sec=0.5)
+                    else:
+                        raw_turn = 0.0
                 else:
-                    raw_turn = -0.5
+                    if node.last_error > 0.2:
+                        raw_turn = 0.6  # line is to the left, steer left to find it
+                    elif node.last_error < -0.2:
+                        raw_turn = -0.6 # line is to the right, steer right to find it
+                    else:
+                        raw_turn = -0.5
         elif vectors.vector_count == 1:
             deviation = vectors.vector_1[1].x - vectors.vector_1[0].x
             error = deviation / half_width
             derivative = error - node.last_error
-            raw_turn = (error * 1.2) + (derivative * 0.8)
-            curvature_term = abs(derivative) * 1.5
-            speed = max(MIN_CORNER_SPEED, TARGET_CRUISE_SPEED - (abs(error) + curvature_term) * SPEED_CURVE_SLOWDOWN_GAIN)
+            raw_turn = (error * 0.6) + (derivative * 1.5)
+            speed = max(MIN_CORNER_SPEED, TARGET_CRUISE_SPEED - abs(error) * SPEED_CURVE_SLOWDOWN_GAIN)
             node.last_error = error
         elif vectors.vector_count == 2:
             # Pure Pursuit: Look-ahead point (top of the lane lines)
@@ -601,25 +994,66 @@ class NavigationAction(Behavior):
             deviation = half_width - lane_center
             error = deviation / half_width
             derivative = error - node.last_error
-            raw_turn = (error * 1.5) + (derivative * 1.0)
-            
-            # curvature estimate: how fast error is changing, not just its magnitude
-            curvature_term = abs(derivative) * 1.5
-            speed = max(MIN_CORNER_SPEED,
-                        TARGET_CRUISE_SPEED - (abs(error) + curvature_term) * SPEED_CURVE_SLOWDOWN_GAIN)
+            raw_turn = (error * 1.2) + (derivative * 1.8)
+            speed = max(MIN_CORNER_SPEED, TARGET_CRUISE_SPEED - abs(error) * SPEED_CURVE_SLOWDOWN_GAIN)
             node.last_error = error
+
+        if getattr(node, 'cone_detected', False):
+            speed = 0.7
+            node.get_logger().info("Cone detected! Slowing down for slalom.", throttle_duration_sec=0.5)
+
+        # Compute repulsive force from nearby obstacles
+        repulsive_steer_offset = 0.0
+        if node.latest_scan is not None:
+            scan = node.latest_scan
+            angles = np.arange(scan.angle_min, scan.angle_max, scan.angle_increment)
+            ranges = np.array(scan.ranges)
+            min_len = min(len(angles), len(ranges))
+            angles = angles[:min_len]
+            ranges = ranges[:min_len]
+
+            valid_idx = (ranges > scan.range_min) & (ranges < 4.0) & ~np.isinf(ranges)
+            valid_ranges = ranges[valid_idx]
+            valid_angles = angles[valid_idx]
+
+            obs_x = valid_ranges * np.cos(valid_angles)
+            obs_y = valid_ranges * np.sin(valid_angles)
+
+            # Filter to relevant track region
+            track_mask = (obs_x > 0.0) & (obs_x < LATTICE_TRACK_X_MAX) & (np.abs(obs_y) <= LATTICE_TRACK_Y_MAX)
+            obs_x = obs_x[track_mask]
+            obs_y = obs_y[track_mask]
+
+            if len(obs_x) > 0:
+                for ox, oy in zip(obs_x, obs_y):
+                    dist = math.sqrt(ox**2 + oy**2)
+                    if dist > 0.1 and dist < REPULSIVE_LOOKAHEAD_DIST:
+                        # Repulsive force points away from the obstacle
+                        # oy > 0 means obstacle on left -> steer right (negative turn)
+                        # oy < 0 means obstacle on right -> steer left (positive turn)
+                        force = REPULSIVE_FORCE_GAIN / (dist ** 2)
+                        if oy > 0:
+                            repulsive_steer_offset -= force
+                        else:
+                            repulsive_steer_offset += force
+                
+                # Cap the maximum contribution of repulsive steer offset
+                repulsive_steer_offset = max(-0.5, min(0.5, repulsive_steer_offset))
 
         # Higher alpha to reduce phase lag (which causes oscillations)
         alpha = 0.6
         node.smoothed_turn = alpha * raw_turn + (1.0 - alpha) * node.smoothed_turn
 
-        node.get_logger().info(f"Lane Tracking Error: {node.last_error:.2f} (midpoint deviation)", throttle_duration_sec=0.5)
+        # Add the repulsive force offset to the smoothed turn command
+        target_turn_command = max(-1.0, min(1.0, node.smoothed_turn + repulsive_steer_offset))
+
+        node.get_logger().info(f"Lane Tracking Error: {node.last_error:.2f} (midpoint deviation), Repulsive Offset: {repulsive_steer_offset:.2f}", throttle_duration_sec=0.5)
 
         if vectors.vector_count == 0 and not in_hospital_memory:
             # Bypass lattice planner at intersections so it doesn't try to avoid the corner walls and ruin the turn
-            planner_speed, planner_turn = speed, node.smoothed_turn
+            planner_speed, planner_turn = speed, target_turn_command
         else:
-            planner_speed, planner_turn = node._run_lattice_planner(node.smoothed_turn, speed)
+            planner_speed, planner_turn = node._run_lattice_planner(target_turn_command, speed)
             
         node.rover_move_manual_mode(planner_speed, planner_turn)
         return NodeStatus.RUNNING
@@ -633,9 +1067,14 @@ class LineFollower(Node):
         self.subscription_server = self.create_subscription(ServerCommunication, '/ServerCommunication', self.server_communication_callback, QOS_PROFILE_DEFAULT)
         self.subscription_qr = self.create_subscription(String, '/qr_detection', self.qr_detection_callback, QOS_PROFILE_DEFAULT)
         self.subscription_signs = self.create_subscription(String, '/sign_board_detection', self.sign_board_callback, QOS_PROFILE_DEFAULT)
+        self.subscription_camera = self.create_subscription(CompressedImage, '/camera/image_raw/compressed', self.camera_callback, QOS_PROFILE_DEFAULT)
+
+        self.cone_detected = False
+        self.cone_detected_time = 0.0
 
         self.publisher_joy = self.create_publisher(Joy, '/cerebri/in/joy', QOS_PROFILE_DEFAULT)
         self.publisher_server = self.create_publisher(ServerCommunication, '/ServerCommunication', QOS_PROFILE_DEFAULT)
+        self.publisher_parking_guide = self.create_publisher(String, '/parking_guide_data', QOS_PROFILE_DEFAULT)
 
         self.target_speed = 0.0
         self.target_turn = 0.0
@@ -645,7 +1084,7 @@ class LineFollower(Node):
         self.smoothed_turn = 0.0
         self.last_error = 0.0
         
-        self.show_lattice_window = False  # Disabled: imshow at 20Hz kills RTF significantly
+        self.show_lattice_window = True  # Disabled: imshow at 20Hz kills RTF significantly
 
         # Mission state variables
         self.last_detected_sign = None
@@ -654,6 +1093,9 @@ class LineFollower(Node):
         self.intersection_exit_ticks = 0
         self.is_hospital_zone = False
         self.last_turn_clear_time = 0.0
+        self.hospital_lane_memory_active = False
+        self.hospital_resume_time = 0.0
+        self.hospital_resume_straight = False
         
         # Debounce tracking for sign config
         self.current_sign_payload = None
@@ -705,11 +1147,12 @@ class LineFollower(Node):
             ]),
             Selector([
                 MissionController(),
+                # LargeObstacleAvoidanceBehavior(),
                 NavigationAction()
             ])
         ])
 
-        self.control_timer = self.create_timer(0.1, self.tick_bt_and_publish)  # 10Hz — enough for smooth control, avoids heavy 20Hz CPU load
+        self.control_timer = self.create_timer(0.02, self.tick_bt_and_publish)  # 50Hz
         self.get_logger().info("Line Follower initialized. Behavior Tree Active.")
 
     def tick_bt_and_publish(self):
@@ -721,13 +1164,32 @@ class LineFollower(Node):
         msg.axes = [0.0, self.target_speed, is_overtaking, self.target_turn]
         self.publisher_joy.publish(msg)
 
+        # Publish parking guide data so edge_vectors can draw Ackermann arc projections
+        guide_msg = String()
+        guide_msg.data = json.dumps({
+            'mission_state': self.mission_state,
+            'steer': float(self.target_turn),
+            'speed': float(self.target_speed),
+        })
+        self.publisher_parking_guide.publish(guide_msg)
+
     def rover_move_manual_mode(self, speed, turn):
         # Smoothly limit linear acceleration and deceleration
         dt = 0.05
-        max_speed_change = MAX_ACCEL_LIMIT * dt
+        accel = getattr(self, 'current_accel_limit', MAX_ACCEL_LIMIT)
+        max_speed_change = accel * dt
         speed_diff = speed - self.target_speed
         if abs(speed_diff) > max_speed_change:
             speed = self.target_speed + np.sign(speed_diff) * max_speed_change
+
+        # Rate-limit steering
+        if getattr(self, '_emergency_steer', False):
+            self._emergency_steer = False
+        else:
+            max_turn_change = MAX_STEER_RATE * dt
+            turn_diff = turn - self.target_turn
+            if abs(turn_diff) > max_turn_change:
+                turn = self.target_turn + np.sign(turn_diff) * max_turn_change
 
         self.target_speed = float(max(min(speed, SPEED_MAX), -SPEED_MAX))
         self.target_turn = float(max(min(turn, TURN_MAX), -TURN_MAX))
@@ -768,8 +1230,42 @@ class LineFollower(Node):
         LAT_ACCEL_MAX = LATTICE_LAT_ACCEL_MAX
         num_candidates = LATTICE_NUM_CANDIDATES
         
-        candidates = np.linspace(-1.0, 1.0, num_candidates)
+        # Check if there is a large obstacle using full LiDAR forward range (up to 4.0m)
+        has_large_obstacle = False
+        has_obstacle = False
+        dynamic_buffer_dist = 0.65 # Default for small obstacles
+        obs_center_y = 0.0
+        
+        if len(obs_x) > 0:
+            # Detect obstacles in the forward lane using max range
+            front_mask = (obs_x > 0.1) & (np.abs(obs_y) <= 0.4) 
+            if np.any(front_mask):
+                has_obstacle = True
+                obs_center_y = float(np.mean(obs_y[front_mask]))
+                obs_width = np.max(obs_y[front_mask]) - np.min(obs_y[front_mask])
+                if obs_width > 0.3:
+                    has_large_obstacle = True
+                    dynamic_buffer_dist = 2.0
+
+        # 2D Grid of Polynomial Parameters
+        # c2_norm controls initial steering (-1.0 to 1.0)
+        # c3_norm controls curve change over distance (-1.0 to 1.0)
+        c2_candidates = np.linspace(-1.0, 1.0, 25)
+        if has_obstacle:
+            if obs_center_y > 0.0:
+                c2_candidates = np.linspace(-1.0, 0.0, 13)
+            else:
+                c2_candidates = np.linspace(0.0, 1.0, 13)
+                
+        if has_large_obstacle:
+            c3_candidates = np.linspace(-1.0, 1.0, 25)
+        else:
+            c3_candidates = np.array([0.0]) # Only simple arcs for normal driving
+        
         max_steer_angle = LATTICE_MAX_STEER_ANGLE
+        # c2_max corresponds to max steering angle: kappa = tan(delta)/L = 2*c2
+        c2_max = math.tan(max_steer_angle) / (2.0 * wheelbase)
+        c3_max = 0.5 # Tuning parameter for how aggressively the S-curve bends back
         
         vis_img = None
         if getattr(self, 'show_lattice_window', False):
@@ -792,73 +1288,119 @@ class LineFollower(Node):
         best_speed = desired_speed
 
         # --- Evaluate Paths ---
-        for cand_steer in candidates:
-            delta = cand_steer * max_steer_angle
-            
-            # 1. Exact Kinematic Path Generation
-            if abs(delta) < 1e-4:
-                # Straight line
-                x = np.linspace(0, desired_speed * dt * steps, steps)
-                y = np.zeros(steps)
-                v_step = desired_speed
-            else:
-                # Ackermann arc
-                R = wheelbase / math.tan(delta)
-                v_curve_limit = math.sqrt(LAT_ACCEL_MAX * abs(R))
-                v_step = max(0.2, min(desired_speed, v_curve_limit))
+        for c2_norm in c2_candidates:
+            for c3_norm in c3_candidates:
+                c2 = c2_norm * c2_max
+                c3 = c3_norm * c3_max
+                cand_steer = c2_norm # Maps directly to immediate steering command
                 
-                d_theta = (v_step / R) * dt
-                theta = np.cumsum(np.full(steps, d_theta))
-                x = R * np.sin(theta)
-                y = R * (1 - np.cos(theta))
+                delta = cand_steer * max_steer_angle
+                
+                # 1. Cubic Polynomial Path Generation (y = c3*x^3 + c2*x^2)
+                if abs(delta) < 1e-4:
+                    v_step = desired_speed
+                else:
+                    R = wheelbase / math.tan(delta)
+                    v_curve_limit = math.sqrt(LAT_ACCEL_MAX * abs(R))
+                    v_step = max(0.2, min(desired_speed, v_curve_limit))
+                
+                max_x = v_step * dt * steps
+                x = np.linspace(0, max_x, steps)
+                y = c3 * (x ** 3) + c2 * (x ** 2)
+                path_points = np.column_stack((x, y))
 
-            path_points = np.column_stack((x, y))
-            min_path_dist = float('inf')
-            collision = False
+                min_path_dist = float('inf')
+                collision = False
 
-            # 2. Vectorized Collision Checking
-            if len(obstacles) > 0:
-                # Calculate distance from every path point to every obstacle using broadcasting
-                diff = path_points[:, np.newaxis, :] - obstacles[np.newaxis, :, :]
-                dists = np.linalg.norm(diff, axis=2)
-                min_dists_per_step = np.min(dists, axis=1)
-                min_path_dist = np.min(min_dists_per_step)
+                # 2. Vectorized Collision Checking
+                if len(obstacles) > 0:
+                    diff = path_points[:, np.newaxis, :] - obstacles[np.newaxis, :, :]
+                    dists = np.linalg.norm(diff, axis=2)
+                    min_dists_per_step = np.min(dists, axis=1)
+                    min_path_dist = np.min(min_dists_per_step)
 
-                if min_path_dist < LATTICE_COLLISION_RADIUS: # Hard collision boundary
-                    continue
+                    if min_path_dist < LATTICE_COLLISION_RADIUS: # Hard collision boundary
+                        if vis_img is not None:
+                            for i in range(len(path_points) - 1):
+                                p1, p2 = path_points[i], path_points[i + 1]
+                                cv2.line(vis_img, (int(250 - p1[1] * 100), int(500 - p1[0] * 100)),
+                                          (int(250 - p2[1] * 100), int(500 - p2[0] * 100)), (0, 0, 200), 1)
+                        continue
 
-            # 3. Cost Evaluation
-            cost = 0.0
-            
-            # Soft Obstacle Penalty (Allows obstacle hugging / close passing based on parameters)
-            if min_path_dist < COST_OBSTACLE_BUFFER_DIST:
-                cost += obstacle_w * math.exp(-COST_OBSTACLE_DECAY * (min_path_dist - LATTICE_COLLISION_RADIUS))
+                if vis_img is not None:
+                    for i in range(len(path_points) - 1):
+                        p1, p2 = path_points[i], path_points[i + 1]
+                        cv2.line(vis_img, (int(250 - p1[1] * 100), int(500 - p1[0] * 100)),
+                                  (int(250 - p2[1] * 100), int(500 - p2[0] * 100)), (0, 200, 200), 1)
 
-            # Tracking Penalty (deviation from ideal lane keeping)
-            steer_diff = abs(cand_steer - desired_steer)
-            cost += tracking_lin_w * steer_diff + tracking_quad_w * (steer_diff ** 2)
+                # 3. Cost Evaluation
+                cost = 0.0
+                
+                # Soft Obstacle Penalty
+                if min_path_dist <= dynamic_buffer_dist:
+                    calc_dist = max(0.20, min_path_dist)
+                    multiplier = (dynamic_buffer_dist - calc_dist) / dynamic_buffer_dist
+                    cost += obstacle_w * (multiplier * 1000.0)
 
-            # Smoothness Penalty (deviation from current actuator state)
-            cost += COST_SMOOTHNESS_WEIGHT * abs(cand_steer - self.target_turn)
+                # Tracking Penalty
+                steer_diff = abs(cand_steer - desired_steer)
+                current_lin_w = tracking_lin_w
+                current_quad_w = tracking_quad_w
+                
+                if min_path_dist <= dynamic_buffer_dist:
+                    calc_dist_track = max(0.20, min_path_dist)
+                    relaxation_factor = max(0.2, (calc_dist_track / dynamic_buffer_dist))
+                    current_lin_w *= relaxation_factor
+                    current_quad_w *= relaxation_factor
+                    
+                cost += current_lin_w * steer_diff + current_quad_w * (steer_diff ** 2)
 
-            # Directional Bias (Overtake logic preference)
-            if len(obstacles) > 0:
-                closest_obs_idx = np.argmin(np.linalg.norm(obstacles, axis=1))
-                closest_obs_y = obstacles[closest_obs_idx, 1]
-                if closest_obs_y > 0 and cand_steer > 0:
-                    cost += COST_DIRECTIONAL_BIAS_WEIGHT * cand_steer
-                elif closest_obs_y < 0 and cand_steer < 0:
-                    cost += COST_DIRECTIONAL_BIAS_WEIGHT * abs(cand_steer)
+                # Smoothness Penalty
+                cost += COST_SMOOTHNESS_WEIGHT * abs(cand_steer - self.target_turn)
 
-            # 4. Selection
-            if cost < min_cost:
-                min_cost = cost
-                best_steer = cand_steer
-                best_path_points = path_points
-                best_obs_dist = min_path_dist
-                best_speed = v_step
+                # Polynomial Complexity Penalty (prefers simple arcs/lines if obstacles are clear)
+                cost += abs(c3_norm) * 10.0
+
+                # Directional Bias
+                if len(obstacles) > 0:
+                    closest_obs_idx = np.argmin(np.linalg.norm(obstacles, axis=1))
+                    closest_obs_y = obstacles[closest_obs_idx, 1]
+                    if closest_obs_y > 0 and cand_steer > 0:
+                        cost += COST_DIRECTIONAL_BIAS_WEIGHT * cand_steer
+                    elif closest_obs_y < 0 and cand_steer < 0:
+                        cost += COST_DIRECTIONAL_BIAS_WEIGHT * abs(cand_steer)
+
+                # 4. Selection
+                if cost < min_cost:
+                    min_cost = cost
+                    best_steer = cand_steer
+                    best_path_points = path_points
+                    best_obs_dist = min_path_dist
+                    best_speed = v_step
 
         # --- Fallback & Speed Adjustment ---
+        current_obs_dist = np.min(np.linalg.norm(obstacles, axis=1)) if len(obstacles) > 0 else float('inf')
+
+        if not hasattr(self, 'lattice_is_locked'):
+            self.lattice_is_locked = False
+            self.locked_steer = 0.0
+            self.locked_speed = 0.0
+
+        if self.lattice_is_locked:
+            if current_obs_dist > 0.75:
+                self.lattice_is_locked = False
+            else:
+                best_steer = self.locked_steer
+                best_speed = self.locked_speed
+                min_cost = 0.0
+                best_obs_dist = 0.6
+
+        if not self.lattice_is_locked and current_obs_dist <= 0.65 and min_cost != float('inf'):
+            self.lattice_is_locked = True
+            self.locked_steer = best_steer
+            self.locked_speed = best_speed
+            best_obs_dist = 0.6
+
         if min_cost == float('inf'):
             self.get_logger().warn("Lattice Planner: All paths blocked! Reactive turn.", throttle_duration_sec=1.0)
             if len(obstacles) > 0:
@@ -867,12 +1409,15 @@ class LineFollower(Node):
                     best_steer = -1.0 # Obstacle on left, turn right
                 else:
                     best_steer = 1.0  # Obstacle on right, turn left
+            self._emergency_steer = True
             return max(0.2, desired_speed * 0.4), best_steer
 
         # Dynamic proximity slowdown
         final_speed = best_speed
-        if best_obs_dist < 0.35:
-            final_speed = max(0.3, best_speed * (best_obs_dist / 0.35))
+        self.current_accel_limit = MAX_ACCEL_LIMIT
+        if best_obs_dist < 0.5:
+            final_speed = max(0.3, best_speed * (best_obs_dist / 0.5))
+            self.current_accel_limit = 0.5  # Decrease acceleration near obstacle
 
         # --- Visualization ---
         if vis_img is not None and best_path_points is not None:
@@ -884,6 +1429,37 @@ class LineFollower(Node):
             cv2.waitKey(1)
 
         return final_speed, best_steer
+
+    def camera_callback(self, message):
+        np_arr = np.frombuffer(message.data, np.uint8)
+        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if image is None:
+            return
+
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+        # Red/Dark Orange color bounds (for simulated traffic cones)
+        lower_red1 = np.array([0, 70, 50])
+        upper_red1 = np.array([15, 255, 255])
+        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+
+        lower_red2 = np.array([170, 70, 50])
+        upper_red2 = np.array([180, 255, 255])
+        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+
+        mask = cv2.bitwise_or(mask1, mask2)
+
+        h, w = mask.shape
+        roi = mask[h // 2 :, :]  # only lower half of image
+        orange_pixels = cv2.countNonZero(roi)
+
+        current_time = self.get_clock().now().nanoseconds / 1e9
+        if orange_pixels > 500:
+            self.cone_detected = True
+            self.cone_detected_time = current_time
+        else:
+            if current_time - getattr(self, 'cone_detected_time', 0.0) > 0.5:
+                self.cone_detected = False
 
     def lidar_callback(self, message):
         self.latest_scan = message
@@ -954,7 +1530,7 @@ class LineFollower(Node):
 
     def sign_board_callback(self, message):
         current_time = self.get_clock().now().nanoseconds / 1e9
-        if current_time - self.last_turn_clear_time < 6.0:
+        if current_time - self.last_turn_clear_time < 3.0:
             return
         if message.data:
             try:
